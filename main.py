@@ -6,9 +6,13 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import re
 import chromadb
+import traceback
+from dotenv import load_dotenv, set_key
+
 import streamlit as st
 import psutil
 import torch
+import requests
 from llama_index.core import VectorStoreIndex, StorageContext, Settings, get_response_synthesizer
 from llama_index.core.schema import TextNode, NodeWithScore
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
@@ -24,6 +28,9 @@ from llama_index.llms.openai_like import OpenAILike
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
+
+# 自动加载.env文件
+load_dotenv(dotenv_path=Path(__file__).parent / '.env', override=True)
 
 # ================== Streamlit页面配置 ==================
 st.set_page_config(
@@ -48,7 +55,7 @@ def disable_streamlit_watcher():
 
 # ================== 配置类 ==================
 class Config:
-    EMBED_MODEL_PATH = r"./model/embedding_model/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    EMBED_MODEL_PATH = r"./model/embedding_model/fengshan/ChatLaw-Text2Vec"
     RERANK_MODEL_PATH = r"./model/rank/Qwen/Qwen3-Reranker-0___6B"
 
     DATA_DIR = "./json_data"
@@ -396,7 +403,15 @@ def init_sidebar():
     with st.sidebar:
         st.header("⚙️ 模型配置")
         
-        # LLM选择
+        # LLM选择（保存到 session_state，便于按钮切换）
+        # 如果有外部请求切换（例如按钮），先把请求应用到 selectbox 的初始值
+        if 'llm_choice_requested' in st.session_state:
+            requested = st.session_state.pop('llm_choice_requested')
+            st.session_state.llm_choice_select = requested
+
+        if 'llm_choice_select' not in st.session_state:
+            st.session_state.llm_choice_select = 'deepseek'
+
         llm_choice = st.selectbox(
             "选择LLM模型",
             options=["deepseek", "glm", "local"],
@@ -404,18 +419,44 @@ def init_sidebar():
                 "deepseek": "DeepSeek",
                 "glm": "智谱GLM", 
                 "local": "本地模型"
-            }[x]
+            }[x],
+            key='llm_choice_select'
         )
-        
-        # API Key输入
+
+        # 仅为需要 API Key 的所选模型显示输入框
         api_key = None
-        if llm_choice in ["deepseek", "glm"]:
-            api_key = st.text_input(
-                f"{'DeepSeek' if llm_choice == 'deepseek' else 'GLM'} API Key",
-                type="password",
-                placeholder=f"请输入您的{'DeepSeek' if llm_choice == 'deepseek' else 'GLM'} API Key",
-                help="API Key是使用云端模型必需的，请从对应平台获取"
-            )
+        env_path = str(Path(__file__).parent / '.env')
+        if llm_choice == 'deepseek':
+            current = os.environ.get('LLM_API_KEY', '')
+            api_input = st.text_input('DeepSeek API Key', value=current, type='password', help='DeepSeek API Key，留空则不能调用 DeepSeek')
+            if api_input and api_input != current:
+                try:
+                    set_key(env_path, 'LLM_API_KEY', api_input)
+                    os.environ['LLM_API_KEY'] = api_input
+                except Exception as e:
+                    print(f"写 .env 失败: {e}")
+            api_key = os.environ.get('LLM_API_KEY')
+        elif llm_choice == 'glm':
+            current = os.environ.get('GLM_API_KEY', '')
+            api_input = st.text_input('GLM API Key', value=current, type='password', help='GLM API Key，留空则不能调用 GLM')
+            if api_input and api_input != current:
+                try:
+                    set_key(env_path, 'GLM_API_KEY', api_input)
+                    os.environ['GLM_API_KEY'] = api_input
+                except Exception as e:
+                    print(f"写 .env 失败: {e}")
+            api_key = os.environ.get('GLM_API_KEY')
+        else:
+            # local 模型：检查本地模型目录是否存在可用模型
+            local_models_dir = Path(__file__).parent / 'model' / 'chat_models'
+            local_available = local_models_dir.exists() and any(local_models_dir.iterdir())
+            if not local_available:
+                st.warning(f"⚠️ 未检测到本地聊天模型于: {local_models_dir}。请先将模型放入该目录，或切换到云端模型。")
+                col1, col2 = st.columns(2)
+                if col1.button('切换到 DeepSeek'):
+                    st.session_state.llm_choice_requested = 'deepseek'
+                if col2.button('切换到 GLM'):
+                    st.session_state.llm_choice_requested = 'glm'
         
         # 模型参数调整
         st.subheader("模型参数")
@@ -536,6 +577,113 @@ def show_reference_details(nodes):
             st.markdown(f"相关度：`{node.score:.4f}`")
             st.info(f"{node.node.text}")
 
+
+def synthesize_with_retries(synthesizer, prompt: str, nodes: List, retries: int = 3, initial_delay: float = 2.0):
+    """对 response_synthesizer.synthesize 添加有限重试和指数退避。
+
+    参数:
+        synthesizer: response_synthesizer 实例
+        prompt: 用户输入
+        nodes: 用于合成的节点列表
+        retries: 最大重试次数
+        initial_delay: 初始等待秒数，后续按 2^n 指数增长
+    返回:
+        合成器返回的对象（与原 synthesize 返回相同）
+    抛出:
+        最后一次异常（若全部重试失败）
+    """
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            return synthesizer.synthesize(prompt, nodes=nodes)
+        except Exception as e:
+            last_exc = e
+            print(f"[synthesize_with_retries] 尝试 {attempt}/{retries} 失败: {e}")
+            traceback.print_exc()
+            if attempt == retries:
+                # 重试完毕，重复抛出最后的异常
+                raise
+            # 指数退避
+            wait = initial_delay * (2 ** (attempt - 1))
+            print(f"[synthesize_with_retries] 等待 {wait}s 后重试...")
+            time.sleep(wait)
+
+
+def try_auto_switch_llm(current_choice: str) -> bool:
+    """尝试自动切换 LLM（按优先级 deepseek -> glm -> local），如果切换成功返回 True。
+
+    切换会调用 `init_models` 并更新 `st.session_state` 与 `Settings.llm`。
+    """
+    candidates = ["deepseek", "glm", "local"]
+    for cand in candidates:
+        if cand == current_choice:
+            continue
+
+        # 远端模型需要 API Key 且其 api_base 必须可达
+        if cand in ("deepseek", "glm"):
+            api_key_name = 'LLM_API_KEY' if cand == 'deepseek' else 'GLM_API_KEY'
+            api_key = os.environ.get(api_key_name)
+            if not api_key:
+                print(f"[try_auto_switch_llm] 跳过 {cand}：未找到环境变量 {api_key_name}")
+                continue
+
+            api_base = LLM_CONFIGS.get(cand, {}).get('api_base')
+            if not api_base:
+                print(f"[try_auto_switch_llm] 跳过 {cand}：未配置 api_base")
+                continue
+
+            # 轻量可达性检测（快速 HTTP 请求）
+            try:
+                resp = requests.get(api_base, timeout=2)
+                # 仅要求能够建立连接并返回，不强求 200
+                print(f"[try_auto_switch_llm] {cand} api_base 可达: {api_base} (status {resp.status_code})")
+            except Exception as e:
+                print(f"[try_auto_switch_llm] {cand} api_base 不可达: {api_base}，原因: {e}")
+                continue
+
+            # 尝试初始化模型
+            try:
+                embed_model, llm, reranker, chosen = init_models(cand, api_key)
+                if llm is not None:
+                    st.session_state.current_llm_choice = chosen
+                    st.session_state.llm = llm
+                    st.session_state.embed_model = embed_model
+                    st.session_state.reranker = reranker
+                    Settings.llm = llm
+                    st.success(f"已切换到备用模型: {chosen}")
+                    print(f"[try_auto_switch_llm] 已切换到可用模型: {chosen}")
+                    return True
+            except Exception as e:
+                print(f"[try_auto_switch_llm] 初始化 {cand} 失败: {e}")
+                traceback.print_exc()
+                continue
+
+        # 本地候选：检查本地聊天模型目录
+        if cand == 'local':
+            local_models_dir = Path(__file__).parent / 'model' / 'chat_models'
+            if not (local_models_dir.exists() and any(local_models_dir.iterdir())):
+                print(f"[try_auto_switch_llm] 本地模型目录无可用模型: {local_models_dir}")
+                continue
+            try:
+                embed_model, llm, reranker, chosen = init_models('local', None)
+                if llm is not None:
+                    st.session_state.current_llm_choice = chosen
+                    st.session_state.llm = llm
+                    st.session_state.embed_model = embed_model
+                    st.session_state.reranker = reranker
+                    Settings.llm = llm
+                    st.success("已切换到本地模型")
+                    print("[try_auto_switch_llm] 已切换到本地模型")
+                    return True
+            except Exception as e:
+                print(f"[try_auto_switch_llm] 初始化本地模型失败: {e}")
+                traceback.print_exc()
+                continue
+
+    print("[try_auto_switch_llm] 未找到可用的远程模型或本地备选")
+    st.warning("未找到可用的备用模型。请检查 API Key 或本地模型目录。")
+    return False
+
 # ================== 主程序 ==================
 def main():
     # 禁用 Streamlit 文件热重载（放在更安全的位置）
@@ -631,9 +779,63 @@ def main():
             if not filtered_nodes:
                 response_text = "⚠️ 未找到相关法律条文，请尝试调整问题描述或咨询专业律师。"
             else:
-                # 生成回答
-                response = response_synthesizer.synthesize(prompt, nodes=filtered_nodes)
-                response_text = response.response
+                # 生成回答（安全调用：带重试与回退）
+                try:
+                    response = synthesize_with_retries(response_synthesizer, prompt, filtered_nodes, retries=3)
+                    response_text = response.response
+                except Exception as e:
+                    # 打印详细跟踪以便调试
+                    print("[main] response_synthesizer 生成失败，进入回退逻辑:")
+                    traceback.print_exc()
+                    # 向用户显示友好提示
+                    st.error("⚠️ 后端模型服务异常，正在尝试切换备用模型或回退为临时结果。")
+
+                    # 优先尝试自动切换到其它可用模型并重试一次
+                    switched = False
+                    try:
+                        switched = try_auto_switch_llm(st.session_state.get('current_llm_choice', llm_choice))
+                    except Exception as e_switch:
+                        print(f"[main] 自动切换模型过程发生错误: {e_switch}")
+
+                    if switched:
+                        try:
+                            # 使用新的 LLM 重新创建合成器并重试
+                            response_synthesizer = get_response_synthesizer(verbose=True)
+                            response = synthesize_with_retries(response_synthesizer, prompt, filtered_nodes, retries=2)
+                            response_text = response.response
+                            # 如果成功则跳过后续回退逻辑
+                        except Exception as e2:
+                            print("[main] 切换到备用模型后重试仍失败:", e2)
+                            traceback.print_exc()
+                            switched = False
+
+                    if not switched:
+                        # 将前3条检索到的文档拼接为临时内容
+                        concatenated = "\n\n".join([n.node.text for n in filtered_nodes[:3]])
+
+                        # 尝试使用本地小模型做快速摘要（如果配置并存在本地模型）
+                        summary_text = None
+                        try:
+                            local_cfg = LLM_CONFIGS.get("local")
+                            if local_cfg:
+                                local_model_path = local_cfg.get("model")
+                                if local_model_path and Path(local_model_path).exists():
+                                    try:
+                                        hf_llm = HuggingFaceLLM(model_name=str(local_model_path), temperature=0.2, max_length=256)
+                                        # 使用hf_llm进行快速摘要
+                                        summary_text = hf_llm.predict(f"请简要总结以下法律条文要点：\n\n{concatenated}\n\n总结：")
+                                    except Exception as e_local:
+                                        print(f"[fallback] 本地模型摘要失败: {e_local}")
+                        except Exception as e_cfg:
+                            print(f"[fallback] 检查本地模型时发生错误: {e_cfg}")
+
+                        if summary_text:
+                            cleaned_response = summary_text
+                            response_text = f"⚠️ 后端服务异常，使用本地模型生成的临时摘要：\n\n{summary_text}"
+                        else:
+                            # 回退到拼接的原文
+                            cleaned_response = concatenated
+                            response_text = f"⚠️ 后端模型服务异常：{e}\n\n相关条文（临时结果）：\n{concatenated}"
             
             # 显示回答
             with st.chat_message("assistant"):
