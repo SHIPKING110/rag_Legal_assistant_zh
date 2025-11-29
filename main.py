@@ -1,0 +1,667 @@
+# -*- coding: utf-8 -*-
+import json
+import time
+import os
+from pathlib import Path
+from typing import List, Dict, Optional
+import re
+import chromadb
+import streamlit as st
+import psutil
+import torch
+from llama_index.core import VectorStoreIndex, StorageContext, Settings, get_response_synthesizer
+from llama_index.core.schema import TextNode, NodeWithScore
+from llama_index.core.postprocessor.types import BaseNodePostprocessor
+from llama_index.core import QueryBundle
+from llama_index.llms.huggingface import HuggingFaceLLM
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.core import PromptTemplate
+from llama_index.core.postprocessor import SentenceTransformerRerank
+from llama_index.llms.openai_like import OpenAILike
+
+# 设置环境变量，强制使用本地文件
+os.environ['HF_HUB_OFFLINE'] = '1'
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
+
+# ================== Streamlit页面配置 ==================
+st.set_page_config(
+    page_title="智能法律咨询助手",
+    page_icon="⚖️",
+    layout="centered",
+    initial_sidebar_state="auto"
+)
+
+def disable_streamlit_watcher():
+    """更安全的方式禁用Streamlit文件监视器"""
+    try:
+        from streamlit import runtime
+        if runtime.exists():
+            instance = runtime.get_instance()
+            def _on_script_changed(_):
+                return
+            if hasattr(instance, '_on_script_changed'):
+                instance._on_script_changed = _on_script_changed
+    except Exception as e:
+        print(f"禁用文件监视器时出现警告: {e}")
+
+# ================== 配置类 ==================
+class Config:
+    EMBED_MODEL_PATH = r"./model/embedding_model/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    RERANK_MODEL_PATH = r"./model/rank/Qwen/Qwen3-Reranker-0___6B"
+
+    DATA_DIR = "./json_data"
+    VECTOR_DB_DIR = "./chroma_db"
+    PERSIST_DIR = "./storage"
+    
+    COLLECTION_NAME = "chinese_labor_laws"
+    TOP_K = 10
+    RERANK_TOP_K = 3
+    RERANK_MODEL_MIN_MEMORY_GB = 4  # rank模型最小需要的内存（GB）
+
+# ================== 设备检测和内存工具 ==================
+def detect_device():
+    """检测设备是否支持GPU，返回设备类型"""
+    if torch.cuda.is_available():
+        device = "cuda"
+        device_name = torch.cuda.get_device_name(0)
+        return device, f"GPU ({device_name})"
+    else:
+        return "cpu", "CPU"
+
+def get_available_memory_gb():
+    """获取系统可用内存（GB）"""
+    memory = psutil.virtual_memory()
+    available_gb = memory.available / (1024 ** 3)
+    return available_gb
+
+def check_rank_model_memory():
+    """检查是否有足够内存加载rank模型"""
+    available_memory = get_available_memory_gb()
+    required_memory = Config.RERANK_MODEL_MIN_MEMORY_GB
+    
+    return available_memory >= required_memory, available_memory, required_memory
+
+# ================== 修复后的自定义重排序器 ==================
+class SimpleQwenReranker(BaseNodePostprocessor):
+    # 使用 Pydantic 字段定义
+    model_path: str
+    top_n: int = 3
+    device: str = "cpu"
+    auto_load: bool = False
+    
+    def __init__(self, model_path: str, top_n: int = 3, device: str = "cpu", auto_load: bool = False):
+        # 使用 Pydantic 的方式初始化（所有参数都必须传递给super().__init__）
+        super().__init__(model_path=model_path, top_n=top_n, device=device, auto_load=auto_load)
+        
+        # 初始化内部状态
+        self._is_loaded = False
+        self._model = None
+        
+        # 仅当auto_load为True时才加载模型
+        if auto_load:
+            self._try_load_model()
+    
+    def _try_load_model(self):
+        """尝试加载模型，但不抛出异常"""
+        try:
+            from sentence_transformers import CrossEncoder
+            self._model = CrossEncoder(
+                self.model_path, 
+                trust_remote_code=True, 
+                local_files_only=True,
+                device=self.device
+            )
+            
+            # 修复：设置填充令牌
+            if hasattr(self._model, 'tokenizer') and self._model.tokenizer.pad_token is None:
+                self._model.tokenizer.pad_token = self._model.tokenizer.eos_token
+            
+            self._is_loaded = True
+            print(f"✅ Qwen3-Reranker 加载成功 (设备: {self.device}): {self.model_path}")
+            
+        except Exception as e:
+            print(f"❌ 重排序模型加载失败: {e}")
+            self._is_loaded = False
+    
+    def is_loaded(self):
+        return self._is_loaded
+    
+    def load_model(self):
+        """主动加载模型"""
+        if not self._is_loaded:
+            self._try_load_model()
+        return self._is_loaded
+    
+    def unload_model(self):
+        """卸载模型释放内存"""
+        if self._model is not None:
+            del self._model
+            self._model = None
+            self._is_loaded = False
+            print("✅ Rank模型已卸载，内存已释放")
+    
+    def _postprocess_nodes(self, nodes: List[NodeWithScore], query_bundle: QueryBundle):
+        if not nodes or not self._is_loaded or self._model is None:
+            return nodes[:self.top_n] if nodes else []
+        
+        try:
+            # 准备查询-文档对
+            query_doc_pairs = []
+            for node in nodes:
+                query_doc_pairs.append([query_bundle.query_str, node.node.get_content()])
+            
+            # 逐个处理，避免批量填充问题
+            scores = []
+            for pair in query_doc_pairs:
+                score = self._model.predict([pair])
+                scores.append(float(score[0]))
+            
+            # 将分数添加到节点
+            for node, score in zip(nodes, scores):
+                node.score = score
+            
+            # 按分数排序并返回前top_n个
+            sorted_nodes = sorted(nodes, key=lambda x: x.score, reverse=True)
+            return sorted_nodes[:self.top_n]
+            
+        except Exception as e:
+            print(f"重排序失败: {e}")
+            return nodes[:self.top_n]
+
+# ================== LLM配置选项 ==================
+LLM_CONFIGS = {
+    "deepseek": {
+        "model": "deepseek-chat",
+        "api_base": "https://api.deepseek.com/v1",
+        "context_window": 32768,
+        "max_tokens": 2048,
+        "temperature": 0.3,
+        "top_p": 0.7
+    },
+    "glm": {
+        "model": "glm-4",
+        "api_base": "https://open.bigmodel.cn/api/paas/v4",
+        "context_window": 128000,
+        "max_tokens": 1024,
+        "temperature": 0.3,
+        "top_p": 0.7
+    },
+    "local": {
+        "model": "/home/cw/llms/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        "api_base": "http://localhost:23333/v1",
+        "context_window": 4096,
+        "max_tokens": 1024,
+        "temperature": 0.3,
+        "top_p": 0.7
+    }
+}
+
+# ================== 缓存资源初始化 ==================
+@st.cache_resource(show_spinner="初始化模型中...")
+def init_models(llm_choice="deepseek", api_key=None):
+    # 检查嵌入模型是否存在
+    embed_model_path = Path(Config.EMBED_MODEL_PATH)
+    if not embed_model_path.exists():
+        st.error(f"❌ 嵌入模型路径不存在: {Config.EMBED_MODEL_PATH}")
+        st.info("请确保模型已正确下载到指定路径")
+        st.stop()
+    
+    embed_model = HuggingFaceEmbedding(
+        model_name=str(embed_model_path),
+    )
+    
+    # 检查重排序模型是否存在（默认不加载）
+    rerank_model_path = Path(Config.RERANK_MODEL_PATH)
+    if not rerank_model_path.exists():
+        st.warning(f"⚠️ 重排序模型路径不存在: {Config.RERANK_MODEL_PATH}")
+        st.info("rank模型功能不可用")
+        reranker = None
+    else:
+        try:
+            # 检测设备
+            device, device_name = detect_device()
+            
+            # 创建重排序器实例，但不自动加载（auto_load=False）
+            reranker = SimpleQwenReranker(
+                model_path=str(rerank_model_path),
+                top_n=Config.RERANK_TOP_K,
+                device=device,
+                auto_load=False  # 默认不加载
+            )
+            print(f"✅ Rank模型已初始化（未加载）, 检测到设备: {device_name}")
+                
+        except Exception as e:
+            # 更详细的错误信息
+            import traceback
+            error_details = traceback.format_exc()
+            st.error(f"❌ 重排序模型初始化失败: {str(e)}")
+            st.info("将禁用重排序功能，仅使用基础检索")
+            reranker = None
+    
+    config = LLM_CONFIGS[llm_choice]
+    
+    if llm_choice == "deepseek":
+        if not api_key:
+            st.error("❌ 请提供DeepSeek API Key")
+            Settings.embed_model = embed_model
+            return embed_model, None, reranker, llm_choice
+        
+        llm = OpenAILike(
+            model=config["model"],
+            api_base=config["api_base"],
+            api_key=api_key,
+            context_window=config["context_window"],
+            is_chat_model=True,
+            is_function_calling_model=False,
+            max_tokens=config["max_tokens"],
+            temperature=config["temperature"],
+            top_p=config["top_p"]
+        )
+    elif llm_choice == "glm":
+        if not api_key:
+            st.error("❌ 请提供GLM API Key")
+            Settings.embed_model = embed_model
+            return embed_model, None, reranker, llm_choice
+            
+        llm = OpenAILike(
+            model=config["model"],
+            api_base=config["api_base"],
+            api_key=api_key,
+            context_window=config["context_window"],
+            is_chat_model=True,
+            is_function_calling_model=False,
+            max_tokens=config["max_tokens"],
+            temperature=config["temperature"],
+            top_p=config["top_p"]
+        )
+    else:  # local
+        llm = OpenAILike(
+            model=config["model"],
+            api_base=config["api_base"],
+            api_key="fake",
+            context_window=config["context_window"],
+            is_chat_model=True,
+            is_function_calling_model=False,
+            max_tokens=config["max_tokens"],
+            temperature=config["temperature"],
+            top_p=config["top_p"]
+        )
+    
+    Settings.embed_model = embed_model
+    Settings.llm = llm
+    
+    return embed_model, llm, reranker, llm_choice
+
+@st.cache_resource(show_spinner="加载知识库中...")
+def init_vector_store(_nodes):
+    chroma_client = chromadb.PersistentClient(path=Config.VECTOR_DB_DIR)
+    chroma_collection = chroma_client.get_or_create_collection(
+        name=Config.COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"}
+    )
+
+    if chroma_collection.count() == 0 and _nodes is not None:
+        # 新建索引
+        storage_context = StorageContext.from_defaults(
+            vector_store=ChromaVectorStore(chroma_collection=chroma_collection)
+        )
+        storage_context.docstore.add_documents(_nodes)  
+        index = VectorStoreIndex(
+            _nodes,
+            storage_context=storage_context,
+            show_progress=True
+        )
+        # 创建persist目录
+        Path(Config.PERSIST_DIR).mkdir(parents=True, exist_ok=True)
+        storage_context.persist(persist_dir=Config.PERSIST_DIR)
+        index.storage_context.persist(persist_dir=Config.PERSIST_DIR)
+    else:
+        # 加载现有索引
+        storage_context = StorageContext.from_defaults(
+            vector_store=ChromaVectorStore(chroma_collection=chroma_collection)
+        )
+        index = VectorStoreIndex.from_vector_store(
+            storage_context.vector_store,
+            storage_context=storage_context,
+            embed_model=Settings.embed_model
+        )
+    return index
+
+# ================== 数据处理 ==================
+def load_and_validate_json_files(data_dir: str) -> List[Dict]:
+    """加载并验证JSON法律文件"""
+    json_files = list(Path(data_dir).glob("*.json"))
+    assert json_files, f"未找到JSON文件于 {data_dir}"
+    
+    all_data = []
+    for json_file in json_files:
+        with open(json_file, 'r', encoding='utf-8') as f:
+            try:
+                data = json.load(f)
+                # 验证数据结构
+                if not isinstance(data, list):
+                    raise ValueError(f"文件 {json_file.name} 根元素应为列表")
+                for item in data:
+                    if not isinstance(item, dict):
+                        raise ValueError(f"文件 {json_file.name} 包含非字典元素")
+                    for k, v in item.items():
+                        if not isinstance(v, str):
+                            raise ValueError(f"文件 {json_file.name} 中键 '{k}' 的值不是字符串")
+                all_data.extend({
+                    "content": item,
+                    "metadata": {"source": json_file.name}
+                } for item in data)
+            except Exception as e:
+                raise RuntimeError(f"加载文件 {json_file} 失败: {str(e)}")
+    
+    print(f"成功加载 {len(all_data)} 个法律文件条目")
+    return all_data
+
+def create_nodes(raw_data: List[Dict]) -> List[TextNode]:
+    """添加ID稳定性保障"""
+    nodes = []
+    for entry in raw_data:
+        law_dict = entry["content"]
+        source_file = entry["metadata"]["source"]
+        
+        for full_title, content in law_dict.items():
+            # 生成稳定ID（避免重复）
+            node_id = f"{source_file}::{full_title}"
+            
+            parts = full_title.split(" ", 1)
+            law_name = parts[0] if len(parts) > 0 else "未知法律"
+            article = parts[1] if len(parts) > 1 else "未知条款"
+            
+            node = TextNode(
+                text=content,
+                id_=node_id,  # 显式设置稳定ID
+                metadata={
+                    "law_name": law_name,
+                    "article": article,
+                    "full_title": full_title,
+                    "source_file": source_file,
+                    "content_type": "legal_article"
+                }
+            )
+            nodes.append(node)
+    
+    print(f"生成 {len(nodes)} 个文本节点（ID示例：{nodes[0].id_}）")
+    return nodes
+
+# ================== 界面组件 ==================
+def init_sidebar():
+    """侧边栏配置"""
+    with st.sidebar:
+        st.header("⚙️ 模型配置")
+        
+        # LLM选择
+        llm_choice = st.selectbox(
+            "选择LLM模型",
+            options=["deepseek", "glm", "local"],
+            format_func=lambda x: {
+                "deepseek": "DeepSeek",
+                "glm": "智谱GLM", 
+                "local": "本地模型"
+            }[x]
+        )
+        
+        # API Key输入
+        api_key = None
+        if llm_choice in ["deepseek", "glm"]:
+            api_key = st.text_input(
+                f"{'DeepSeek' if llm_choice == 'deepseek' else 'GLM'} API Key",
+                type="password",
+                placeholder=f"请输入您的{'DeepSeek' if llm_choice == 'deepseek' else 'GLM'} API Key",
+                help="API Key是使用云端模型必需的，请从对应平台获取"
+            )
+        
+        # 模型参数调整
+        st.subheader("模型参数")
+        temperature = st.slider("Temperature", 0.0, 1.0, 0.3, 0.1)
+        top_p = st.slider("Top P", 0.0, 1.0, 0.7, 0.1)
+        max_tokens = st.slider("最大生成长度", 512, 4096, 1024, 128)
+        
+        # 检索参数
+        st.subheader("检索参数")
+        top_k = st.slider("检索数量", 5, 30, 10, 5)
+        rerank_top_k = st.slider("重排序数量", 1, 10, 3, 1)
+        min_rerank_score = st.slider("最小重排序分数", 0.0, 1.0, 0.4, 0.1)
+        
+        # 更新配置
+        Config.TOP_K = top_k
+        Config.RERANK_TOP_K = rerank_top_k
+        
+        # Rank模型启用开关
+        st.divider()
+        st.subheader("⭐ Rank模型管理")
+        
+        # 初始化rank模型开关状态
+        if "enable_rank_model" not in st.session_state:
+            st.session_state.enable_rank_model = False
+        
+        # 检测设备和内存
+        device, device_name = detect_device()
+        available_memory, required_memory = get_available_memory_gb(), Config.RERANK_MODEL_MIN_MEMORY_GB
+        memory_sufficient = available_memory >= required_memory
+        
+        # 显示设备信息
+        st.info(f"📱 检测到设备: {device_name}")
+        st.info(f"💾 可用内存: {available_memory:.2f}GB / 需要: {required_memory}GB")
+        
+        # Rank模型启用开关
+        reranker = st.session_state.get("reranker")
+        rank_model_available = reranker is not None and Path(Config.RERANK_MODEL_PATH).exists()
+        
+        if not rank_model_available:
+            st.warning("⚠️ Rank模型不可用（未找到模型文件）")
+            enable_rank = False
+        elif not memory_sufficient:
+            st.warning(f"⚠️ 内存不足！需要{required_memory}GB，当前仅{available_memory:.2f}GB")
+            enable_rank = False
+        else:
+            enable_rank = st.checkbox(
+                "启用Rank重排序模型",
+                value=st.session_state.enable_rank_model,
+                help="启用后会使用AI模型对检索结果进行智能重排序，可能会消耗较多内存"
+            )
+        
+        # 处理rank模型启用/禁用
+        if enable_rank and not st.session_state.enable_rank_model:
+            # 用户启用rank模型
+            st.session_state.enable_rank_model = True
+            if reranker is not None and hasattr(reranker, 'load_model'):
+                with st.spinner("正在加载Rank模型..."):
+                    if reranker.load_model():
+                        st.success("✅ Rank模型加载成功")
+                    else:
+                        st.error("❌ Rank模型加载失败，已禁用")
+                        st.session_state.enable_rank_model = False
+        elif not enable_rank and st.session_state.enable_rank_model:
+            # 用户禁用rank模型
+            st.session_state.enable_rank_model = False
+            if reranker is not None and hasattr(reranker, 'unload_model'):
+                reranker.unload_model()
+        
+        # 显示模型状态
+        st.divider()
+        st.subheader("模型状态")
+        
+        embed_status = "✅ 已加载" if Path(Config.EMBED_MODEL_PATH).exists() else "❌ 未找到"
+        
+        if reranker is not None and hasattr(reranker, 'is_loaded') and reranker.is_loaded():
+            rerank_status = "✅ 已启用"
+        elif rank_model_available:
+            rerank_status = "⏸️ 已初始化（未启用）"
+        else:
+            rerank_status = "❌ 不可用"
+        
+        st.write(f"嵌入模型: {embed_status}")
+        st.write(f"Rank模型: {rerank_status}")
+        
+        st.divider()
+        st.info("💡 提示：DeepSeek模型需要有效的API Key，可在官网申请")
+        
+        return llm_choice, api_key, temperature, top_p, max_tokens, min_rerank_score
+
+def init_chat_interface():
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    
+    for msg in st.session_state.messages:
+        role = msg["role"]
+        content = msg.get("cleaned", msg["content"])  # 优先使用清理后的内容
+        
+        with st.chat_message(role):
+            st.markdown(content)
+            
+            # 如果是助手消息且包含思维链
+            if role == "assistant" and msg.get("think"):
+                with st.expander("📝 模型思考过程（历史对话）"):
+                    for think_content in msg["think"]:
+                        st.markdown(f'<span style="color: #808080">{think_content.strip()}</span>',
+                                  unsafe_allow_html=True)
+            
+            # 如果是助手消息且有参考依据（需要保持原有参考依据逻辑）
+            if role == "assistant" and "reference_nodes" in msg:
+                show_reference_details(msg["reference_nodes"])
+
+def show_reference_details(nodes):
+    with st.expander("查看支持依据"):
+        for idx, node in enumerate(nodes, 1):
+            meta = node.node.metadata
+            st.markdown(f"**[{idx}] {meta['full_title']}**")
+            st.caption(f"来源文件：{meta['source_file']} | 法律名称：{meta['law_name']}")
+            st.markdown(f"相关度：`{node.score:.4f}`")
+            st.info(f"{node.node.text}")
+
+# ================== 主程序 ==================
+def main():
+    # 禁用 Streamlit 文件热重载（放在更安全的位置）
+    try:
+        disable_streamlit_watcher()
+    except Exception as e:
+        # 忽略这个错误，不影响主要功能
+        print(f"禁用文件监视器时出现警告: {e}")
+    
+    st.title("⚖️ 智能法律咨询助手")
+    st.markdown("欢迎使用中华人民共和国法律智能咨询系统，请输入您的问题，我们将基于最新中华人民共和国法律法规为您解答。")
+
+    # 侧边栏配置
+    llm_choice, api_key, temperature, top_p, max_tokens, min_rerank_score = init_sidebar()
+    
+    # 更新LLM配置
+    if llm_choice in LLM_CONFIGS:
+        LLM_CONFIGS[llm_choice]["temperature"] = temperature
+        LLM_CONFIGS[llm_choice]["top_p"] = top_p
+        LLM_CONFIGS[llm_choice]["max_tokens"] = max_tokens
+
+    # 初始化会话状态
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    
+    # 检查是否需要重新初始化模型（当配置改变时）
+    current_config = f"{llm_choice}_{api_key}_{temperature}_{top_p}_{max_tokens}"
+    if "last_config" not in st.session_state or st.session_state.last_config != current_config:
+        with st.spinner("正在初始化模型..."):
+            embed_model, llm, reranker, current_llm_choice = init_models(llm_choice, api_key)
+            st.session_state.last_config = current_config
+            st.session_state.current_llm_choice = current_llm_choice
+            st.session_state.embed_model = embed_model
+            st.session_state.llm = llm
+            st.session_state.reranker = reranker
+    
+    # 初始化数据
+    if not Path(Config.VECTOR_DB_DIR).exists():
+        with st.spinner("正在构建知识库..."):
+            raw_data = load_and_validate_json_files(Config.DATA_DIR)
+            nodes = create_nodes(raw_data)
+    else:
+        nodes = None
+    
+    index = init_vector_store(nodes)
+    retriever = index.as_retriever(
+        similarity_top_k=Config.TOP_K,
+        vector_store_query_mode="hybrid",
+        alpha=0.5
+    )
+    
+    response_synthesizer = get_response_synthesizer(verbose=True)
+    
+    # 聊天界面
+    init_chat_interface()
+    
+    if prompt := st.chat_input("请输入中华人民共和国法律相关问题"):
+        # 检查模型是否已正确初始化
+        if st.session_state.get("llm") is None:
+            st.error("❌ 请先配置API Key并确保模型初始化成功")
+            st.stop()
+        
+        # 添加用户消息到历史
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # 处理查询
+        with st.spinner("正在分析问题..."):
+            start_time = time.time()
+            
+            # 检索流程
+            initial_nodes = retriever.retrieve(prompt)
+            
+            # 使用会话状态中的 reranker（仅在启用且已加载时使用）
+            reranker = st.session_state.reranker
+            enable_rank = st.session_state.get("enable_rank_model", False)
+            
+            if enable_rank and reranker is not None and hasattr(reranker, 'is_loaded') and reranker.is_loaded():
+                try:
+                    reranked_nodes = reranker.postprocess_nodes(initial_nodes, query_str=prompt)
+                    # 过滤节点
+                    filtered_nodes = [node for node in reranked_nodes if node.score > min_rerank_score]
+                    st.success("✅ 已使用重排序功能")
+                except Exception as e:
+                    st.warning(f"⚠️ 重排序失败: {e}，使用基础检索结果")
+                    filtered_nodes = initial_nodes[:Config.RERANK_TOP_K]
+            else:
+                # 如果没有启用重排序模型，直接使用初始节点
+                st.info("⚠️ Rank模型未启用，使用基础检索结果")
+                filtered_nodes = initial_nodes[:Config.RERANK_TOP_K]  # 取前几个节点
+            
+            if not filtered_nodes:
+                response_text = "⚠️ 未找到相关法律条文，请尝试调整问题描述或咨询专业律师。"
+            else:
+                # 生成回答
+                response = response_synthesizer.synthesize(prompt, nodes=filtered_nodes)
+                response_text = response.response
+            
+            # 显示回答
+            with st.chat_message("assistant"):
+                # 提取思维链内容并清理响应文本
+                think_contents = re.findall(r'<think>(.*?)</think>', response_text, re.DOTALL)
+                cleaned_response = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL).strip()
+                
+                # 显示清理后的回答
+                st.markdown(cleaned_response)
+                
+                # 如果有思维链内容则显示
+                if think_contents:
+                    with st.expander("📝 模型思考过程（点击展开）"):
+                        for content in think_contents:
+                            st.markdown(f'<span style="color: #808080">{content.strip()}</span>', 
+                                      unsafe_allow_html=True)
+                
+                # 显示参考依据
+                show_reference_details(filtered_nodes[:3])
+
+            # 添加助手消息到历史（需要存储原始响应）
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response_text,  # 保留原始响应
+                "cleaned": cleaned_response,  # 存储清理后的文本
+                "think": think_contents,  # 存储思维链内容
+                "reference_nodes": filtered_nodes[:3]  # 存储参考节点
+            })
+
+if __name__ == "__main__":
+    main()
