@@ -24,6 +24,9 @@ from llama_index.core import PromptTemplate
 from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.llms.openai_like import OpenAILike
 
+# 导入配置类
+from utils import Config, LLM_CONFIGS
+
 # 设置环境变量，强制使用本地文件
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
@@ -52,20 +55,6 @@ def disable_streamlit_watcher():
                 instance._on_script_changed = _on_script_changed
     except Exception as e:
         print(f"禁用文件监视器时出现警告: {e}")
-
-# ================== 配置类 ==================
-class Config:
-    EMBED_MODEL_PATH = r"./model/embedding_model/fengshan/ChatLaw-Text2Vec"
-    RERANK_MODEL_PATH = r"./model/rank/Qwen/Qwen3-Reranker-0___6B"
-
-    DATA_DIR = "./json_data"
-    VECTOR_DB_DIR = "./chroma_db"
-    PERSIST_DIR = "./storage"
-    
-    COLLECTION_NAME = "chinese_labor_laws"
-    TOP_K = 10
-    RERANK_TOP_K = 3
-    RERANK_MODEL_MIN_MEMORY_GB = 4  # rank模型最小需要的内存（GB）
 
 # ================== 设备检测和内存工具 ==================
 def detect_device():
@@ -176,34 +165,6 @@ class SimpleQwenReranker(BaseNodePostprocessor):
         except Exception as e:
             print(f"重排序失败: {e}")
             return nodes[:self.top_n]
-
-# ================== LLM配置选项 ==================
-LLM_CONFIGS = {
-    "deepseek": {
-        "model": "deepseek-chat",
-        "api_base": "https://api.deepseek.com/v1",
-        "context_window": 32768,
-        "max_tokens": 2048,
-        "temperature": 0.3,
-        "top_p": 0.7
-    },
-    "glm": {
-        "model": "glm-4",
-        "api_base": "https://open.bigmodel.cn/api/paas/v4",
-        "context_window": 128000,
-        "max_tokens": 1024,
-        "temperature": 0.3,
-        "top_p": 0.7
-    },
-    "local": {
-        "model": "/home/cw/llms/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-        "api_base": "http://localhost:23333/v1",
-        "context_window": 4096,
-        "max_tokens": 1024,
-        "temperature": 0.3,
-        "top_p": 0.7
-    }
-}
 
 # ================== 缓存资源初始化 ==================
 @st.cache_resource(show_spinner="初始化模型中...")
@@ -493,7 +454,10 @@ def init_sidebar():
         
         # Rank模型启用开关
         reranker = st.session_state.get("reranker")
-        rank_model_available = reranker is not None and Path(Config.RERANK_MODEL_PATH).exists()
+        # 先检查模型文件是否存在，不依赖 reranker 对象是否已初始化
+        rank_model_file_exists = Path(Config.RERANK_MODEL_PATH).exists()
+        # 只要模型文件存在就认为可用（即使 reranker 对象还未初始化）
+        rank_model_available = rank_model_file_exists
         
         if not rank_model_available:
             st.warning("⚠️ Rank模型不可用（未找到模型文件）")
@@ -512,7 +476,10 @@ def init_sidebar():
         if enable_rank and not st.session_state.enable_rank_model:
             # 用户启用rank模型
             st.session_state.enable_rank_model = True
-            if reranker is not None and hasattr(reranker, 'load_model'):
+            # 如果 reranker 还没有初始化，提示用户需要先进行一次对话
+            if reranker is None:
+                st.info("ℹ️ Rank模型将在首次使用时初始化，请先进行一次对话")
+            elif hasattr(reranker, 'load_model'):
                 with st.spinner("正在加载Rank模型..."):
                     if reranker.load_model():
                         st.success("✅ Rank模型加载成功")
@@ -531,6 +498,7 @@ def init_sidebar():
         
         embed_status = "✅ 已加载" if Path(Config.EMBED_MODEL_PATH).exists() else "❌ 未找到"
         
+        # 判断 rank 模型状态：优先检查是否已加载，然后检查是否可用
         if reranker is not None and hasattr(reranker, 'is_loaded') and reranker.is_loaded():
             rerank_status = "✅ 已启用"
         elif rank_model_available:
@@ -760,9 +728,16 @@ def main():
     if "history" not in st.session_state:
         st.session_state.history = []
     
-    # 检查是否需要重新初始化模型（当配置改变时）
+    # 检查是否需要重新初始化模型（当配置改变时，或者模型未初始化时）
     current_config = f"{llm_choice}_{api_key}_{temperature}_{top_p}_{max_tokens}"
-    if "last_config" not in st.session_state or st.session_state.last_config != current_config:
+    need_init = (
+        "last_config" not in st.session_state or 
+        st.session_state.last_config != current_config or
+        st.session_state.get("reranker") is None or
+        st.session_state.get("llm") is None
+    )
+    
+    if need_init:
         with st.spinner("正在初始化模型..."):
             embed_model, llm, reranker, current_llm_choice = init_models(llm_choice, api_key)
             st.session_state.last_config = current_config
