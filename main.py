@@ -25,12 +25,21 @@ from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.llms.openai_like import OpenAILike
 
 # 导入配置和模型配置
-from utils import Config, LLM_CONFIGS, DEEPSEEK_MODELS, GLM_MODELS
+from utils import Config, LLM_CONFIGS, DEEPSEEK_MODELS, GLM_MODELS, QWEN_MODELS
 
 # 设置环境变量，强制使用本地文件
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
+
+# 文档说明文件路径
+DOC_DESCRIPTION_DIR = Path(__file__).parent / 'webui' / 'doc_description'
+DOC_PAGES = {
+    "功能介绍": DOC_DESCRIPTION_DIR / "features.md",
+    "模型功能": DOC_DESCRIPTION_DIR / "models.md",
+    "API申请": DOC_DESCRIPTION_DIR / "api.md",
+}
+DOC_PLACEHOLDER = "请选择文档"
 
 # 自动加载.env文件
 load_dotenv(dotenv_path=Path(__file__).parent / '.env', override=True)
@@ -55,6 +64,35 @@ def disable_streamlit_watcher():
                 instance._on_script_changed = _on_script_changed
     except Exception as e:
         print(f"禁用文件监视器时出现警告: {e}")
+
+
+def load_doc_markdown(doc_key: str) -> str:
+    """读取指定文档说明内容"""
+    path = DOC_PAGES.get(doc_key)
+    if path is None:
+        return f"⚠️ 未找到 {doc_key} 对应的文档配置。"
+    try:
+        return path.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return f"⚠️ 未找到文档文件：{path}"
+    except Exception as exc:
+        return f"⚠️ 读取文档说明文件失败：{exc}"
+
+
+def show_documentation_page():
+    """展示文档说明页面"""
+    stored_key = st.session_state.get("doc_category")
+    if stored_key not in DOC_PAGES:
+        stored_key = next(iter(DOC_PAGES))
+        st.session_state.doc_category = stored_key
+    doc_key = stored_key
+    st.subheader(f"📘 文档说明 · {doc_key}")
+    st.markdown(load_doc_markdown(doc_key))
+    st.divider()
+    if st.button("返回聊天对话", use_container_width=True):
+        st.session_state.show_docs = False
+        st.session_state.doc_category = DOC_PLACEHOLDER
+        st.rerun()
 
 # ================== 设备检测和内存工具 ==================
 def detect_device():
@@ -211,11 +249,13 @@ def init_models(llm_choice="deepseek", api_key=None, llm_sub_choice=None):
     # 基础配置
     config = dict(LLM_CONFIGS[llm_choice])
     
-    # 根据子模型选择覆盖配置（仅 deepseek / glm 支持）
+    # 根据子模型选择覆盖配置（仅 deepseek / glm / qwen 支持）
     if llm_choice == "deepseek" and llm_sub_choice and llm_sub_choice in DEEPSEEK_MODELS:
         config.update(DEEPSEEK_MODELS[llm_sub_choice])
     elif llm_choice == "glm" and llm_sub_choice and llm_sub_choice in GLM_MODELS:
         config.update(GLM_MODELS[llm_sub_choice])
+    elif llm_choice == "qwen" and llm_sub_choice and llm_sub_choice in QWEN_MODELS:
+        config.update(QWEN_MODELS[llm_sub_choice])
     
     if llm_choice == "deepseek":
         if not api_key:
@@ -240,6 +280,23 @@ def init_models(llm_choice="deepseek", api_key=None, llm_sub_choice=None):
             Settings.embed_model = embed_model
             return embed_model, None, reranker, llm_choice
             
+        llm = OpenAILike(
+            model=config["model"],
+            api_base=config["api_base"],
+            api_key=api_key,
+            context_window=config["context_window"],
+            is_chat_model=True,
+            is_function_calling_model=False,
+            max_tokens=config["max_tokens"],
+            temperature=config["temperature"],
+            top_p=config["top_p"]
+        )
+    elif llm_choice == "qwen":
+        if not api_key:
+            st.error("❌ 请提供Qwen API Key")
+            Settings.embed_model = embed_model
+            return embed_model, None, reranker, llm_choice
+        
         llm = OpenAILike(
             model=config["model"],
             api_base=config["api_base"],
@@ -371,6 +428,16 @@ def init_sidebar():
     with st.sidebar:
         st.header("⚙️ 功能模块")
         
+        if "show_docs" not in st.session_state:
+            st.session_state.show_docs = False
+        if "doc_category" not in st.session_state:
+            st.session_state.doc_category = DOC_PLACEHOLDER
+        
+        if st.button("💬 聊天对话", use_container_width=True):
+            st.session_state.show_docs = False
+            st.session_state.doc_category = DOC_PLACEHOLDER
+            st.rerun()
+        
         # 默认值初始化，避免未进入折叠面板时返回 None
         temperature = 0.3
         top_p = 0.7
@@ -392,10 +459,11 @@ def init_sidebar():
 
             llm_choice = st.selectbox(
                 "选择LLM模型",
-                options=["deepseek", "glm", "local"],
+                options=["deepseek", "glm", "qwen", "local"],
                 format_func=lambda x: {
                     "deepseek": "DeepSeek",
-                    "glm": "智谱GLM", 
+                    "glm": "智谱GLM",
+                    "qwen": "阿里云通义Qwen",
                     "local": "本地模型"
                 }[x],
                 key='llm_choice_select'
@@ -422,6 +490,16 @@ def init_sidebar():
                     except Exception as e:
                         print(f"写 .env 失败: {e}")
                 api_key = os.environ.get('GLM_API_KEY')
+            elif llm_choice == 'qwen':
+                current = os.environ.get('QWEN_API_KEY', '')
+                api_input = st.text_input('Qwen API Key', value=current, type='password', help='DashScope API Key，留空则不能调用 Qwen')
+                if api_input and api_input != current:
+                    try:
+                        set_key(env_path, 'QWEN_API_KEY', api_input)
+                        os.environ['QWEN_API_KEY'] = api_input
+                    except Exception as e:
+                        print(f"写 .env 失败: {e}")
+                api_key = os.environ.get('QWEN_API_KEY')
             else:
                 local_models_dir = Path(__file__).parent / 'model' / 'chat_models'
                 local_available = local_models_dir.exists() and any(local_models_dir.iterdir())
@@ -451,6 +529,16 @@ def init_sidebar():
                 options = list(GLM_MODELS.keys())
                 llm_sub_choice = st.selectbox(
                     "GLM 子模型",
+                    options=options,
+                    index=options.index(st.session_state.llm_sub_choice) if st.session_state.llm_sub_choice in options else 0,
+                )
+                st.session_state.llm_sub_choice = llm_sub_choice
+            elif llm_choice == "qwen":
+                if "llm_sub_choice" not in st.session_state:
+                    st.session_state.llm_sub_choice = "qwen-plus"
+                options = list(QWEN_MODELS.keys())
+                llm_sub_choice = st.selectbox(
+                    "Qwen 子模型",
                     options=options,
                     index=options.index(st.session_state.llm_sub_choice) if st.session_state.llm_sub_choice in options else 0,
                 )
@@ -534,6 +622,35 @@ def init_sidebar():
 
             st.write(f"嵌入模型: {embed_status}")
             st.write(f"Rank模型: {rerank_status}")
+
+        # ========= 文档说明 =========
+        with st.expander("文档说明", expanded=False):
+            st.write("查看系统主要功能、模型信息及 API 申请方式。")
+            doc_options = [DOC_PLACEHOLDER] + list(DOC_PAGES.keys())
+            current_doc = st.session_state.get("doc_category", DOC_PLACEHOLDER)
+            current_index = doc_options.index(current_doc) if current_doc in doc_options else 0
+            selected_doc = st.radio(
+                "选择文档类别",
+                options=doc_options,
+                index=current_index,
+            )
+
+            if selected_doc == DOC_PLACEHOLDER:
+                if st.session_state.get("show_docs"):
+                    st.session_state.show_docs = False
+                    st.session_state.doc_category = DOC_PLACEHOLDER
+                    st.rerun()
+            else:
+                should_switch = (
+                    selected_doc != st.session_state.get("doc_category")
+                    or not st.session_state.get("show_docs", False)
+                )
+                if should_switch:
+                    st.session_state.doc_category = selected_doc
+                    st.session_state.show_docs = True
+                    st.rerun()
+
+            st.caption("说明文档存放于 `webui/doc_description/`。")
 
         st.info("💡 提示：DeepSeek模型需要有效的API Key，可在官网申请")
 
@@ -654,18 +771,23 @@ def is_legal_related(question: str, llm) -> bool:
 
 
 def try_auto_switch_llm(current_choice: str) -> bool:
-    """尝试自动切换 LLM（按优先级 deepseek -> glm -> local），如果切换成功返回 True。
+    """尝试自动切换 LLM（按优先级 deepseek -> glm -> qwen -> local），如果切换成功返回 True。
 
     切换会调用 `init_models` 并更新 `st.session_state` 与 `Settings.llm`。
     """
-    candidates = ["deepseek", "glm", "local"]
+    candidates = ["deepseek", "glm", "qwen", "local"]
+    remote_key_map = {
+        "deepseek": "LLM_API_KEY",
+        "glm": "GLM_API_KEY",
+        "qwen": "QWEN_API_KEY",
+    }
     for cand in candidates:
         if cand == current_choice:
             continue
 
         # 远端模型需要 API Key 且其 api_base 必须可达
-        if cand in ("deepseek", "glm"):
-            api_key_name = 'LLM_API_KEY' if cand == 'deepseek' else 'GLM_API_KEY'
+        if cand in remote_key_map:
+            api_key_name = remote_key_map[cand]
             api_key = os.environ.get(api_key_name)
             if not api_key:
                 print(f"[try_auto_switch_llm] 跳过 {cand}：未找到环境变量 {api_key_name}")
@@ -742,6 +864,11 @@ def main():
 
     # 侧边栏配置
     llm_choice, llm_sub_choice, api_key, temperature, top_p, max_tokens, min_rerank_score = init_sidebar()
+    
+    # 如果处于文档模式，则直接显示文档并退出
+    if st.session_state.get("show_docs", False):
+        show_documentation_page()
+        st.stop()
     
     # 更新LLM配置
     if llm_choice in LLM_CONFIGS:
