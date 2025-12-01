@@ -24,8 +24,8 @@ from llama_index.core import PromptTemplate
 from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.llms.openai_like import OpenAILike
 
-# 导入配置类
-from utils import Config, LLM_CONFIGS
+# 导入配置和模型配置
+from utils import Config, LLM_CONFIGS, DEEPSEEK_MODELS, GLM_MODELS
 
 # 设置环境变量，强制使用本地文件
 os.environ['HF_HUB_OFFLINE'] = '1'
@@ -168,7 +168,7 @@ class SimpleQwenReranker(BaseNodePostprocessor):
 
 # ================== 缓存资源初始化 ==================
 @st.cache_resource(show_spinner="初始化模型中...")
-def init_models(llm_choice="deepseek", api_key=None):
+def init_models(llm_choice="deepseek", api_key=None, llm_sub_choice=None):
     # 检查嵌入模型是否存在
     embed_model_path = Path(Config.EMBED_MODEL_PATH)
     if not embed_model_path.exists():
@@ -208,7 +208,14 @@ def init_models(llm_choice="deepseek", api_key=None):
             st.info("将禁用重排序功能，仅使用基础检索")
             reranker = None
     
-    config = LLM_CONFIGS[llm_choice]
+    # 基础配置
+    config = dict(LLM_CONFIGS[llm_choice])
+    
+    # 根据子模型选择覆盖配置（仅 deepseek / glm 支持）
+    if llm_choice == "deepseek" and llm_sub_choice and llm_sub_choice in DEEPSEEK_MODELS:
+        config.update(DEEPSEEK_MODELS[llm_sub_choice])
+    elif llm_choice == "glm" and llm_sub_choice and llm_sub_choice in GLM_MODELS:
+        config.update(GLM_MODELS[llm_sub_choice])
     
     if llm_choice == "deepseek":
         if not api_key:
@@ -419,6 +426,33 @@ def init_sidebar():
                 if col2.button('切换到 GLM'):
                     st.session_state.llm_choice_requested = 'glm'
         
+        # 子模型选择（仅 deepseek / glm 支持）
+        llm_sub_choice = None
+        if llm_choice == "deepseek":
+            # 初始化默认子模型
+            if "llm_sub_choice" not in st.session_state:
+                st.session_state.llm_sub_choice = "deepseek-chat"
+            options = list(DEEPSEEK_MODELS.keys())
+            llm_sub_choice = st.selectbox(
+                "DeepSeek 子模型",
+                options=options,
+                index=options.index(st.session_state.llm_sub_choice) if st.session_state.llm_sub_choice in options else 0,
+            )
+            st.session_state.llm_sub_choice = llm_sub_choice
+        elif llm_choice == "glm":
+            if "llm_sub_choice" not in st.session_state:
+                st.session_state.llm_sub_choice = "glm-4"
+            options = list(GLM_MODELS.keys())
+            llm_sub_choice = st.selectbox(
+                "GLM 子模型",
+                options=options,
+                index=options.index(st.session_state.llm_sub_choice) if st.session_state.llm_sub_choice in options else 0,
+            )
+            st.session_state.llm_sub_choice = llm_sub_choice
+        else:
+            # local 不区分子模型
+            st.session_state.llm_sub_choice = None
+        
         # 模型参数调整
         st.subheader("模型参数")
         temperature = st.slider("Temperature", 0.0, 1.0, 0.3, 0.1)
@@ -512,7 +546,7 @@ def init_sidebar():
         st.divider()
         st.info("💡 提示：DeepSeek模型需要有效的API Key，可在官网申请")
         
-        return llm_choice, api_key, temperature, top_p, max_tokens, min_rerank_score
+        return llm_choice, st.session_state.llm_sub_choice, api_key, temperature, top_p, max_tokens, min_rerank_score
 
 def init_chat_interface():
     if "messages" not in st.session_state:
@@ -662,7 +696,7 @@ def try_auto_switch_llm(current_choice: str) -> bool:
 
             # 尝试初始化模型
             try:
-                embed_model, llm, reranker, chosen = init_models(cand, api_key)
+                embed_model, llm, reranker, chosen = init_models(cand, api_key, None)
                 if llm is not None:
                     st.session_state.current_llm_choice = chosen
                     st.session_state.llm = llm
@@ -684,7 +718,7 @@ def try_auto_switch_llm(current_choice: str) -> bool:
                 print(f"[try_auto_switch_llm] 本地模型目录无可用模型: {local_models_dir}")
                 continue
             try:
-                embed_model, llm, reranker, chosen = init_models('local', None)
+                embed_model, llm, reranker, chosen = init_models('local', None, None)
                 if llm is not None:
                     st.session_state.current_llm_choice = chosen
                     st.session_state.llm = llm
@@ -716,7 +750,7 @@ def main():
     st.markdown("欢迎使用中华人民共和国法律智能咨询系统，请输入您的问题，我们将基于最新中华人民共和国法律法规为您解答。")
 
     # 侧边栏配置
-    llm_choice, api_key, temperature, top_p, max_tokens, min_rerank_score = init_sidebar()
+    llm_choice, llm_sub_choice, api_key, temperature, top_p, max_tokens, min_rerank_score = init_sidebar()
     
     # 更新LLM配置
     if llm_choice in LLM_CONFIGS:
@@ -729,19 +763,20 @@ def main():
         st.session_state.history = []
     
     # 检查是否需要重新初始化模型（当配置改变时，或者模型未初始化时）
-    current_config = f"{llm_choice}_{api_key}_{temperature}_{top_p}_{max_tokens}"
+    current_config = f"{llm_choice}_{llm_sub_choice}_{api_key}_{temperature}_{top_p}_{max_tokens}"
     need_init = (
-        "last_config" not in st.session_state or 
-        st.session_state.last_config != current_config or
-        st.session_state.get("reranker") is None or
-        st.session_state.get("llm") is None
+        "last_config" not in st.session_state
+        or st.session_state.last_config != current_config
+        or st.session_state.get("reranker") is None
+        or st.session_state.get("llm") is None
     )
     
     if need_init:
         with st.spinner("正在初始化模型..."):
-            embed_model, llm, reranker, current_llm_choice = init_models(llm_choice, api_key)
+            embed_model, llm, reranker, current_llm_choice = init_models(llm_choice, api_key, llm_sub_choice)
             st.session_state.last_config = current_config
             st.session_state.current_llm_choice = current_llm_choice
+            st.session_state.current_llm_sub_choice = llm_sub_choice
             st.session_state.embed_model = embed_model
             st.session_state.llm = llm
             st.session_state.reranker = reranker
