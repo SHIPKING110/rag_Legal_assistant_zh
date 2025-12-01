@@ -369,183 +369,174 @@ def create_nodes(raw_data: List[Dict]) -> List[TextNode]:
 def init_sidebar():
     """侧边栏配置"""
     with st.sidebar:
-        st.header("⚙️ 模型配置")
+        st.header("⚙️ 功能模块")
         
-        # LLM选择（保存到 session_state，便于按钮切换）
-        # 如果有外部请求切换（例如按钮），先把请求应用到 selectbox 的初始值
-        if 'llm_choice_requested' in st.session_state:
-            requested = st.session_state.pop('llm_choice_requested')
-            st.session_state.llm_choice_select = requested
-
-        if 'llm_choice_select' not in st.session_state:
-            st.session_state.llm_choice_select = 'deepseek'
-
-        llm_choice = st.selectbox(
-            "选择LLM模型",
-            options=["deepseek", "glm", "local"],
-            format_func=lambda x: {
-                "deepseek": "DeepSeek",
-                "glm": "智谱GLM", 
-                "local": "本地模型"
-            }[x],
-            key='llm_choice_select'
-        )
-
-        # 仅为需要 API Key 的所选模型显示输入框
+        # 默认值初始化，避免未进入折叠面板时返回 None
+        temperature = 0.3
+        top_p = 0.7
+        max_tokens = 1024
+        top_k = Config.TOP_K
+        rerank_top_k = Config.RERANK_TOP_K
+        min_rerank_score = 0.4
         api_key = None
-        env_path = str(Path(__file__).parent / '.env')
-        if llm_choice == 'deepseek':
-            current = os.environ.get('LLM_API_KEY', '')
-            api_input = st.text_input('DeepSeek API Key', value=current, type='password', help='DeepSeek API Key，留空则不能调用 DeepSeek')
-            if api_input and api_input != current:
-                try:
-                    set_key(env_path, 'LLM_API_KEY', api_input)
-                    os.environ['LLM_API_KEY'] = api_input
-                except Exception as e:
-                    print(f"写 .env 失败: {e}")
-            api_key = os.environ.get('LLM_API_KEY')
-        elif llm_choice == 'glm':
-            current = os.environ.get('GLM_API_KEY', '')
-            api_input = st.text_input('GLM API Key', value=current, type='password', help='GLM API Key，留空则不能调用 GLM')
-            if api_input and api_input != current:
-                try:
-                    set_key(env_path, 'GLM_API_KEY', api_input)
-                    os.environ['GLM_API_KEY'] = api_input
-                except Exception as e:
-                    print(f"写 .env 失败: {e}")
-            api_key = os.environ.get('GLM_API_KEY')
-        else:
-            # local 模型：检查本地模型目录是否存在可用模型
-            local_models_dir = Path(__file__).parent / 'model' / 'chat_models'
-            local_available = local_models_dir.exists() and any(local_models_dir.iterdir())
-            if not local_available:
-                st.warning(f"⚠️ 未检测到本地聊天模型于: {local_models_dir}。请先将模型放入该目录，或切换到云端模型。")
-                col1, col2 = st.columns(2)
-                if col1.button('切换到 DeepSeek'):
-                    st.session_state.llm_choice_requested = 'deepseek'
-                if col2.button('切换到 GLM'):
-                    st.session_state.llm_choice_requested = 'glm'
         
-        # 子模型选择（仅 deepseek / glm 支持）
-        llm_sub_choice = None
-        if llm_choice == "deepseek":
-            # 初始化默认子模型
-            if "llm_sub_choice" not in st.session_state:
-                st.session_state.llm_sub_choice = "deepseek-chat"
-            options = list(DEEPSEEK_MODELS.keys())
-            llm_sub_choice = st.selectbox(
-                "DeepSeek 子模型",
-                options=options,
-                index=options.index(st.session_state.llm_sub_choice) if st.session_state.llm_sub_choice in options else 0,
+        # ========= 模型配置 =========
+        with st.expander("模型配置", expanded=False):
+            # LLM选择（保存到 session_state，便于按钮切换）
+            if 'llm_choice_requested' in st.session_state:
+                requested = st.session_state.pop('llm_choice_requested')
+                st.session_state.llm_choice_select = requested
+
+            if 'llm_choice_select' not in st.session_state:
+                st.session_state.llm_choice_select = 'deepseek'
+
+            llm_choice = st.selectbox(
+                "选择LLM模型",
+                options=["deepseek", "glm", "local"],
+                format_func=lambda x: {
+                    "deepseek": "DeepSeek",
+                    "glm": "智谱GLM", 
+                    "local": "本地模型"
+                }[x],
+                key='llm_choice_select'
             )
-            st.session_state.llm_sub_choice = llm_sub_choice
-        elif llm_choice == "glm":
-            if "llm_sub_choice" not in st.session_state:
-                st.session_state.llm_sub_choice = "glm-4"
-            options = list(GLM_MODELS.keys())
-            llm_sub_choice = st.selectbox(
-                "GLM 子模型",
-                options=options,
-                index=options.index(st.session_state.llm_sub_choice) if st.session_state.llm_sub_choice in options else 0,
-            )
-            st.session_state.llm_sub_choice = llm_sub_choice
-        else:
-            # local 不区分子模型
-            st.session_state.llm_sub_choice = None
-        
-        # 模型参数调整
-        st.subheader("模型参数")
-        temperature = st.slider("Temperature", 0.0, 1.0, 0.3, 0.1)
-        top_p = st.slider("Top P", 0.0, 1.0, 0.7, 0.1)
-        max_tokens = st.slider("最大生成长度", 512, 4096, 1024, 128)
-        
-        # 检索参数
-        st.subheader("检索参数")
-        top_k = st.slider("检索数量", 5, 30, 10, 5)
-        rerank_top_k = st.slider("重排序数量", 1, 10, 3, 1)
-        min_rerank_score = st.slider("最小重排序分数", 0.0, 1.0, 0.4, 0.1)
-        
-        # 更新配置
+
+            env_path = str(Path(__file__).parent / '.env')
+            if llm_choice == 'deepseek':
+                current = os.environ.get('LLM_API_KEY', '')
+                api_input = st.text_input('DeepSeek API Key', value=current, type='password', help='DeepSeek API Key，留空则不能调用 DeepSeek')
+                if api_input and api_input != current:
+                    try:
+                        set_key(env_path, 'LLM_API_KEY', api_input)
+                        os.environ['LLM_API_KEY'] = api_input
+                    except Exception as e:
+                        print(f"写 .env 失败: {e}")
+                api_key = os.environ.get('LLM_API_KEY')
+            elif llm_choice == 'glm':
+                current = os.environ.get('GLM_API_KEY', '')
+                api_input = st.text_input('GLM API Key', value=current, type='password', help='GLM API Key，留空则不能调用 GLM')
+                if api_input and api_input != current:
+                    try:
+                        set_key(env_path, 'GLM_API_KEY', api_input)
+                        os.environ['GLM_API_KEY'] = api_input
+                    except Exception as e:
+                        print(f"写 .env 失败: {e}")
+                api_key = os.environ.get('GLM_API_KEY')
+            else:
+                local_models_dir = Path(__file__).parent / 'model' / 'chat_models'
+                local_available = local_models_dir.exists() and any(local_models_dir.iterdir())
+                if not local_available:
+                    st.warning(f"⚠️ 未检测到本地聊天模型于: {local_models_dir}。请先将模型放入该目录，或切换到云端模型。")
+                    col1, col2 = st.columns(2)
+                    if col1.button('切换到 DeepSeek'):
+                        st.session_state.llm_choice_requested = 'deepseek'
+                    if col2.button('切换到 GLM'):
+                        st.session_state.llm_choice_requested = 'glm'
+
+            # 子模型选择
+            llm_sub_choice = None
+            if llm_choice == "deepseek":
+                if "llm_sub_choice" not in st.session_state:
+                    st.session_state.llm_sub_choice = "deepseek-chat"
+                options = list(DEEPSEEK_MODELS.keys())
+                llm_sub_choice = st.selectbox(
+                    "DeepSeek 子模型",
+                    options=options,
+                    index=options.index(st.session_state.llm_sub_choice) if st.session_state.llm_sub_choice in options else 0,
+                )
+                st.session_state.llm_sub_choice = llm_sub_choice
+            elif llm_choice == "glm":
+                if "llm_sub_choice" not in st.session_state:
+                    st.session_state.llm_sub_choice = "glm-4"
+                options = list(GLM_MODELS.keys())
+                llm_sub_choice = st.selectbox(
+                    "GLM 子模型",
+                    options=options,
+                    index=options.index(st.session_state.llm_sub_choice) if st.session_state.llm_sub_choice in options else 0,
+                )
+                st.session_state.llm_sub_choice = llm_sub_choice
+            else:
+                st.session_state.llm_sub_choice = None
+
+        # ========= 模型参数 =========
+        with st.expander("模型参数", expanded=False):
+            temperature = st.slider("Temperature", 0.0, 1.0, 0.3, 0.1)
+            top_p = st.slider("Top P", 0.0, 1.0, 0.7, 0.1)
+            max_tokens = st.slider("最大生成长度", 512, 4096, 1024, 128)
+
+        # ========= 检索参数 =========
+        with st.expander("检索参数", expanded=False):
+            top_k = st.slider("检索数量", 5, 30, Config.TOP_K, 5)
+            rerank_top_k = st.slider("重排序数量", 1, 10, Config.RERANK_TOP_K, 1)
+            min_rerank_score = st.slider("最小重排序分数", 0.0, 1.0, 0.4, 0.1)
+
         Config.TOP_K = top_k
         Config.RERANK_TOP_K = rerank_top_k
-        
-        # Rank模型启用开关
-        st.divider()
-        st.subheader("⭐ Rank模型管理")
-        
-        # 初始化rank模型开关状态
-        if "enable_rank_model" not in st.session_state:
-            st.session_state.enable_rank_model = False
-        
-        # 检测设备和内存
-        device, device_name = detect_device()
-        available_memory, required_memory = get_available_memory_gb(), Config.RERANK_MODEL_MIN_MEMORY_GB
-        memory_sufficient = available_memory >= required_memory
-        
-        # 显示设备信息
-        st.info(f"📱 检测到设备: {device_name}")
-        st.info(f"💾 可用内存: {available_memory:.2f}GB / 需要: {required_memory}GB")
-        
-        # Rank模型启用开关
-        reranker = st.session_state.get("reranker")
-        # 先检查模型文件是否存在，不依赖 reranker 对象是否已初始化
-        rank_model_file_exists = Path(Config.RERANK_MODEL_PATH).exists()
-        # 只要模型文件存在就认为可用（即使 reranker 对象还未初始化）
-        rank_model_available = rank_model_file_exists
-        
-        if not rank_model_available:
-            st.warning("⚠️ Rank模型不可用（未找到模型文件）")
-            enable_rank = False
-        elif not memory_sufficient:
-            st.warning(f"⚠️ 内存不足！需要{required_memory}GB，当前仅{available_memory:.2f}GB")
-            enable_rank = False
-        else:
-            enable_rank = st.checkbox(
-                "启用Rank重排序模型",
-                value=st.session_state.enable_rank_model,
-                help="启用后会使用AI模型对检索结果进行智能重排序，可能会消耗较多内存"
-            )
-        
-        # 处理rank模型启用/禁用
-        if enable_rank and not st.session_state.enable_rank_model:
-            # 用户启用rank模型
-            st.session_state.enable_rank_model = True
-            # 如果 reranker 还没有初始化，提示用户需要先进行一次对话
-            if reranker is None:
-                st.info("ℹ️ Rank模型将在首次使用时初始化，请先进行一次对话")
-            elif hasattr(reranker, 'load_model'):
-                with st.spinner("正在加载Rank模型..."):
-                    if reranker.load_model():
-                        st.success("✅ Rank模型加载成功")
-                    else:
-                        st.error("❌ Rank模型加载失败，已禁用")
-                        st.session_state.enable_rank_model = False
-        elif not enable_rank and st.session_state.enable_rank_model:
-            # 用户禁用rank模型
-            st.session_state.enable_rank_model = False
-            if reranker is not None and hasattr(reranker, 'unload_model'):
-                reranker.unload_model()
-        
-        # 显示模型状态
-        st.divider()
-        st.subheader("模型状态")
-        
-        embed_status = "✅ 已加载" if Path(Config.EMBED_MODEL_PATH).exists() else "❌ 未找到"
-        
-        # 判断 rank 模型状态：优先检查是否已加载，然后检查是否可用
-        if reranker is not None and hasattr(reranker, 'is_loaded') and reranker.is_loaded():
-            rerank_status = "✅ 已启用"
-        elif rank_model_available:
-            rerank_status = "⏸️ 已初始化（未启用）"
-        else:
-            rerank_status = "❌ 不可用"
-        
-        st.write(f"嵌入模型: {embed_status}")
-        st.write(f"Rank模型: {rerank_status}")
-        
-        st.divider()
+
+        # ========= Rank 模型管理 =========
+        with st.expander("⭐ Rank模型管理", expanded=False):
+            if "enable_rank_model" not in st.session_state:
+                st.session_state.enable_rank_model = False
+
+            device, device_name = detect_device()
+            available_memory, required_memory = get_available_memory_gb(), Config.RERANK_MODEL_MIN_MEMORY_GB
+            memory_sufficient = available_memory >= required_memory
+
+            st.info(f"📱 检测到设备: {device_name}")
+            st.info(f"💾 可用内存: {available_memory:.2f}GB / 需要: {required_memory}GB")
+
+            reranker = st.session_state.get("reranker")
+            rank_model_file_exists = Path(Config.RERANK_MODEL_PATH).exists()
+            rank_model_available = rank_model_file_exists
+
+            if not rank_model_available:
+                st.warning("⚠️ Rank模型不可用（未找到模型文件）")
+                enable_rank = False
+            elif not memory_sufficient:
+                st.warning(f"⚠️ 内存不足！需要{required_memory}GB，当前仅{available_memory:.2f}GB")
+                enable_rank = False
+            else:
+                enable_rank = st.checkbox(
+                    "启用Rank重排序模型",
+                    value=st.session_state.enable_rank_model,
+                    help="启用后会使用AI模型对检索结果进行智能重排序，可能会消耗较多内存"
+                )
+
+            if enable_rank and not st.session_state.enable_rank_model:
+                st.session_state.enable_rank_model = True
+                if reranker is None:
+                    st.info("ℹ️ Rank模型将在首次使用时初始化，请先进行一次对话")
+                elif hasattr(reranker, 'load_model'):
+                    with st.spinner("正在加载Rank模型..."):
+                        if reranker.load_model():
+                            st.success("✅ Rank模型加载成功")
+                        else:
+                            st.error("❌ Rank模型加载失败，已禁用")
+                            st.session_state.enable_rank_model = False
+            elif not enable_rank and st.session_state.enable_rank_model:
+                st.session_state.enable_rank_model = False
+                if reranker is not None and hasattr(reranker, 'unload_model'):
+                    reranker.unload_model()
+
+        # ========= 模型状态 =========
+        with st.expander("模型状态", expanded=False):
+            reranker = st.session_state.get("reranker")
+            rank_model_file_exists = Path(Config.RERANK_MODEL_PATH).exists()
+            rank_model_available = rank_model_file_exists
+            embed_status = "✅ 已加载" if Path(Config.EMBED_MODEL_PATH).exists() else "❌ 未找到"
+
+            if reranker is not None and hasattr(reranker, 'is_loaded') and reranker.is_loaded():
+                rerank_status = "✅ 已启用"
+            elif rank_model_available:
+                rerank_status = "⏸️ 已初始化（未启用）"
+            else:
+                rerank_status = "❌ 不可用"
+
+            st.write(f"嵌入模型: {embed_status}")
+            st.write(f"Rank模型: {rerank_status}")
+
         st.info("💡 提示：DeepSeek模型需要有效的API Key，可在官网申请")
-        
+
         return llm_choice, st.session_state.llm_sub_choice, api_key, temperature, top_p, max_tokens, min_rerank_score
 
 def init_chat_interface():
