@@ -46,6 +46,15 @@ from webui.chat_history import (
 # 导入法律检索模块
 from webui.legal_search import render_legal_search_page
 
+# 导入认证模块
+from webui.auth import check_authentication, render_login_page, render_user_info_sidebar, is_admin
+
+# 导入游客页面
+from webui.guest_page import render_guest_page
+
+# 导入管理员面板
+from webui.admin import render_admin_panel
+
 # 设置环境变量，强制使用本地文件
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
@@ -795,11 +804,29 @@ def main():
         # 忽略这个错误，不影响主要功能
         print(f"禁用文件监视器时出现警告: {e}")
     
+    # 检查用户认证
+    if not check_authentication():
+        render_login_page()
+        st.stop()
+    
+    # 检查是否为管理员
+    if is_admin():
+        render_admin_panel()
+        st.stop()
+    
+    # 检查是否为游客模式
+    if st.session_state.get("username") == "游客":
+        render_guest_page()
+        st.stop()
+    
     st.title("⚖️ 智能法律咨询助手")
     st.markdown("欢迎使用中华人民共和国法律智能咨询系统，请输入您的问题，我们将基于最新中华人民共和国法律法规为您解答。")
 
     # 侧边栏配置
     llm_choice, llm_sub_choice, api_key, temperature, top_p, max_tokens, min_rerank_score = init_sidebar()
+    
+    # 在侧边栏显示用户信息
+    render_user_info_sidebar()
     
     # 如果处于法律检索模式，则显示检索页面
     if st.session_state.get("show_legal_search", False):
