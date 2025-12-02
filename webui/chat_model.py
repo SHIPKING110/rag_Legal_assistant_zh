@@ -133,7 +133,7 @@ def is_legal_related(question: str, llm) -> bool:
         return True
 
 
-def handle_chat_message(
+def handle_chat_message_streaming(
     prompt: str,
     retriever,
     response_synthesizer,
@@ -141,7 +141,7 @@ def handle_chat_message(
     min_rerank_score: float,
     try_auto_switch_llm_func
 ):
-    """处理用户聊天消息
+    """处理用户聊天消息（流式输出）
     
     参数:
         prompt: 用户输入的问题
@@ -165,17 +165,39 @@ def handle_chat_message(
     is_legal = is_legal_related(prompt, llm)
     
     if not is_legal:
-        # 与法律无关，直接使用对话模型回答
+        # 与法律无关，直接使用对话模型回答（流式）
         st.info("💬 检测到问题与法律无关，使用对话模式回答")
-        try:
-            response = llm.complete(prompt)
-            response_text = response.text
-            filtered_nodes = []  # 非法律问题没有参考依据
-        except Exception as e:
-            print(f"[handle_chat_message] 直接对话模式失败: {e}")
-            traceback.print_exc()
-            response_text = f"抱歉，我无法回答这个问题。错误信息：{str(e)}"
-            filtered_nodes = []
+        # 创建助手消息容器
+        with st.chat_message("assistant"):
+            try:
+                # 使用流式输出
+                response_text = ""
+                message_placeholder = st.empty()
+                try:
+                    for token in llm.stream_complete(prompt):
+                        if hasattr(token, 'delta'):
+                            response_text += token.delta
+                        else:
+                            response_text += str(token)
+                        message_placeholder.markdown(response_text + "▌")
+                    message_placeholder.markdown(response_text)
+                except (AttributeError, TypeError):
+                    # 如果不支持流式，使用非流式方法
+                    response = llm.complete(prompt)
+                    response_text = response.text
+                    # 模拟流式效果
+                    for i in range(0, len(response_text), 5):
+                        chunk = response_text[:i+5]
+                        message_placeholder.markdown(chunk + "▌")
+                        time.sleep(0.01)
+                    message_placeholder.markdown(response_text)
+                filtered_nodes = []  # 非法律问题没有参考依据
+            except Exception as e:
+                print(f"[handle_chat_message_streaming] 直接对话模式失败: {e}")
+                traceback.print_exc()
+                response_text = f"抱歉，我无法回答这个问题。错误信息：{str(e)}"
+                st.markdown(response_text)
+                filtered_nodes = []
     else:
         # 与法律相关，启用检索流程
         st.info("⚖️ 检测到问题与法律相关，启用法律检索模式")
@@ -190,99 +212,145 @@ def handle_chat_message(
         if enable_rank and reranker is not None and hasattr(reranker, 'is_loaded') and reranker.is_loaded():
             try:
                 reranked_nodes = reranker.postprocess_nodes(initial_nodes, query_str=prompt)
-                # 过滤节点
+                # 过滤节点（按分数过滤）
                 filtered_nodes = [node for node in reranked_nodes if node.score > min_rerank_score]
+                # 启用rank模型时，取前 RERANK_TOP_K 条
+                filtered_nodes = filtered_nodes[:Config.RERANK_TOP_K]
                 st.success("✅ 已使用重排序功能")
                 used_rank = True
             except Exception as e:
                 st.warning(f"⚠️ 重排序失败: {e}，使用基础检索结果")
                 # 回退到按检索相似度排序的前 TOP_K 条
                 filtered_nodes = initial_nodes[:Config.TOP_K]
+                used_rank = False
         else:
-            # 如果没有启用重排序模型，直接使用初始节点
+            # 如果没有启用重排序模型，直接使用初始节点，取前 TOP_K 条
             st.info("⚠️ Rank模型未启用，使用基础检索结果")
             filtered_nodes = initial_nodes[:Config.TOP_K]  # 使用检索得到的前 TOP_K 条
+            used_rank = False
         
-        if not filtered_nodes:
-            response_text = "⚠️ 未找到相关法律条文，请尝试调整问题描述或咨询专业律师。"
-        else:
-            # 构造带有法律RAG提示词的系统提示
-            legal_prompt_text = ""
-            try:
-                legal_prompt_path = Path(Config.LEGAL_CHAT_PROMPT_PATH)
-                if legal_prompt_path.exists():
-                    legal_prompt_text = legal_prompt_path.read_text(encoding="utf-8")
-            except Exception as e:
-                print(f"[handle_chat_message] 读取法律提示词模版失败: {e}")
-
-            if legal_prompt_text:
-                full_prompt = f"{legal_prompt_text}\n\n用户问题：{prompt}"
+        # 创建助手消息容器（流式输出会在这里显示）
+        with st.chat_message("assistant"):
+            if not filtered_nodes:
+                response_text = "⚠️ 未找到相关法律条文，请尝试调整问题描述或咨询专业律师。"
+                st.markdown(response_text)
             else:
-                full_prompt = prompt
-
-            # 生成回答（安全调用：带重试与回退）
-            try:
-                response = synthesize_with_retries(response_synthesizer, full_prompt, filtered_nodes, retries=3)
-                response_text = response.response
-            except Exception as e:
-                # 打印详细跟踪以便调试
-                print("[handle_chat_message] response_synthesizer 生成失败，进入回退逻辑:")
-                traceback.print_exc()
-                # 向用户显示友好提示
-                st.error("⚠️ 后端模型服务异常，正在尝试切换备用模型或回退为临时结果。")
-
-                # 优先尝试自动切换到其它可用模型并重试一次
-                switched = False
+                # 构造带有法律RAG提示词的系统提示
+                legal_prompt_text = ""
                 try:
-                    switched = try_auto_switch_llm_func(st.session_state.get('current_llm_choice', llm_choice))
-                except Exception as e_switch:
-                    print(f"[handle_chat_message] 自动切换模型过程发生错误: {e_switch}")
+                    legal_prompt_path = Path(Config.LEGAL_CHAT_PROMPT_PATH)
+                    if legal_prompt_path.exists():
+                        legal_prompt_text = legal_prompt_path.read_text(encoding="utf-8")
+                except Exception as e:
+                    print(f"[handle_chat_message_streaming] 读取法律提示词模版失败: {e}")
 
-                if switched:
+                if legal_prompt_text:
+                    full_prompt = f"{legal_prompt_text}\n\n用户问题：{prompt}"
+                else:
+                    full_prompt = prompt
+
+                # 生成回答（流式输出）
+                try:
+                    # 使用流式合成响应
+                    response_text = ""
+                    message_placeholder = st.empty()
+                    
+                    # 尝试使用流式方法
                     try:
-                        # 使用新的 LLM 重新创建合成器并重试
-                        response_synthesizer = get_response_synthesizer(verbose=True)
-                        response = synthesize_with_retries(response_synthesizer, prompt, filtered_nodes, retries=2)
+                        # 使用 response_synthesizer 的流式方法
+                        response_gen = response_synthesizer.astream_response(full_prompt, nodes=filtered_nodes)
+                        for token in response_gen.response_gen:
+                            response_text += token
+                            message_placeholder.markdown(response_text + "▌")
+                        message_placeholder.markdown(response_text)
+                    except (AttributeError, TypeError):
+                        # 如果不支持流式，回退到非流式方法
+                        print("[handle_chat_message_streaming] 响应合成器不支持流式，使用非流式方法")
+                        response = synthesize_with_retries(response_synthesizer, full_prompt, filtered_nodes, retries=3)
                         response_text = response.response
-                        # 如果成功则跳过后续回退逻辑
-                    except Exception as e2:
-                        print("[handle_chat_message] 切换到备用模型后重试仍失败:", e2)
-                        traceback.print_exc()
-                        switched = False
+                        # 模拟流式输出效果
+                        for i in range(0, len(response_text), 5):
+                            chunk = response_text[:i+5]
+                            message_placeholder.markdown(chunk + "▌")
+                            time.sleep(0.01)
+                        message_placeholder.markdown(response_text)
+                except Exception as e:
+                    # 打印详细跟踪以便调试
+                    print("[handle_chat_message_streaming] response_synthesizer 生成失败，进入回退逻辑:")
+                    traceback.print_exc()
+                    # 向用户显示友好提示
+                    st.error("⚠️ 后端模型服务异常，正在尝试切换备用模型或回退为临时结果。")
 
-                if not switched:
-                    # 将前3条检索到的文档拼接为临时内容
-                    concatenated = "\n\n".join([n.node.text for n in filtered_nodes[:3]])
-
-                    # 尝试使用本地小模型做快速摘要（如果配置并存在本地模型）
-                    summary_text = None
+                    # 优先尝试自动切换到其它可用模型并重试一次
+                    switched = False
                     try:
-                        local_cfg = LLM_CONFIGS.get("local")
-                        if local_cfg:
-                            local_model_path = local_cfg.get("model")
-                            if local_model_path and Path(local_model_path).exists():
-                                try:
-                                    hf_llm = HuggingFaceLLM(model_name=str(local_model_path), temperature=0.2, max_length=256)
-                                    # 使用hf_llm进行快速摘要
-                                    summary_text = hf_llm.predict(f"请简要总结以下法律条文要点：\n\n{concatenated}\n\n总结：")
-                                except Exception as e_local:
-                                    print(f"[fallback] 本地模型摘要失败: {e_local}")
-                    except Exception as e_cfg:
-                        print(f"[fallback] 检查本地模型时发生错误: {e_cfg}")
+                        switched = try_auto_switch_llm_func(st.session_state.get('current_llm_choice', llm_choice))
+                    except Exception as e_switch:
+                        print(f"[handle_chat_message_streaming] 自动切换模型过程发生错误: {e_switch}")
 
-                    if summary_text:
-                        cleaned_response = summary_text
-                        response_text = f"⚠️ 后端服务异常，使用本地模型生成的临时摘要：\n\n{summary_text}"
-                    else:
-                        # 回退到拼接的原文
-                        cleaned_response = concatenated
-                        response_text = f"⚠️ 后端模型服务异常：{e}\n\n相关条文（临时结果）：\n{concatenated}"
+                    if switched:
+                        try:
+                            # 使用新的 LLM 重新创建合成器并重试（流式）
+                            response_synthesizer = get_response_synthesizer(verbose=True)
+                            response_text = ""
+                            message_placeholder = st.empty()
+                            try:
+                                response_gen = response_synthesizer.astream_response(prompt, nodes=filtered_nodes)
+                                for token in response_gen.response_gen:
+                                    response_text += token
+                                    message_placeholder.markdown(response_text + "▌")
+                                message_placeholder.markdown(response_text)
+                            except (AttributeError, TypeError):
+                                response = synthesize_with_retries(response_synthesizer, prompt, filtered_nodes, retries=2)
+                                response_text = response.response
+                                for i in range(0, len(response_text), 5):
+                                    chunk = response_text[:i+5]
+                                    message_placeholder.markdown(chunk + "▌")
+                                    time.sleep(0.01)
+                                message_placeholder.markdown(response_text)
+                            # 如果成功则跳过后续回退逻辑
+                        except Exception as e2:
+                            print("[handle_chat_message_streaming] 切换到备用模型后重试仍失败:", e2)
+                            traceback.print_exc()
+                            switched = False
+
+                    if not switched:
+                        # 将前3条检索到的文档拼接为临时内容
+                        concatenated = "\n\n".join([n.node.text for n in filtered_nodes[:3]])
+
+                        # 尝试使用本地小模型做快速摘要（如果配置并存在本地模型）
+                        summary_text = None
+                        try:
+                            local_cfg = LLM_CONFIGS.get("local")
+                            if local_cfg:
+                                local_model_path = local_cfg.get("model")
+                                if local_model_path and Path(local_model_path).exists():
+                                    try:
+                                        hf_llm = HuggingFaceLLM(model_name=str(local_model_path), temperature=0.2, max_length=256)
+                                        # 使用hf_llm进行快速摘要
+                                        summary_text = hf_llm.predict(f"请简要总结以下法律条文要点：\n\n{concatenated}\n\n总结：")
+                                    except Exception as e_local:
+                                        print(f"[fallback] 本地模型摘要失败: {e_local}")
+                        except Exception as e_cfg:
+                            print(f"[fallback] 检查本地模型时发生错误: {e_cfg}")
+
+                        if summary_text:
+                            cleaned_response = summary_text
+                            response_text = f"⚠️ 后端服务异常，使用本地模型生成的临时摘要：\n\n{summary_text}"
+                            message_placeholder = st.empty()
+                            message_placeholder.markdown(response_text)
+                        else:
+                            # 回退到拼接的原文
+                            cleaned_response = concatenated
+                            response_text = f"⚠️ 后端模型服务异常：{e}\n\n相关条文（临时结果）：\n{concatenated}"
+                            message_placeholder = st.empty()
+                            message_placeholder.markdown(response_text)
     
     return response_text, filtered_nodes, used_rank
 
 
 def display_chat_response(response_text: str, filtered_nodes: List, used_rank: bool):
-    """显示聊天响应
+    """显示聊天响应（流式输出已在 handle_chat_message_streaming 中完成，这里只处理后续显示）
     
     参数:
         response_text: 响应文本
@@ -293,35 +361,26 @@ def display_chat_response(response_text: str, filtered_nodes: List, used_rank: b
     think_contents = re.findall(r'<think>(.*?)</think>', response_text, re.DOTALL)
     cleaned_response = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL).strip()
     
-    # 显示回答
-    with st.chat_message("assistant"):
-        # 显示清理后的回答
-        st.markdown(cleaned_response)
-        
-        # 如果有思维链内容则显示
-        if think_contents:
-            with st.expander("📝 模型思考过程（点击展开）"):
-                for content in think_contents:
-                    st.markdown(f'<span style="color: #808080">{content.strip()}</span>', 
-                              unsafe_allow_html=True)
-        
-        # 仅在有参考依据时显示（法律相关问题才有参考依据）
-        if filtered_nodes:
-            # 展示数量与检索/重排序设置联动：
-            # - 启用并成功使用 Rank 时：最多展示 RERANK_TOP_K 条
-            # - 未启用 Rank 时：展示所有检索得到的条文（已按 TOP_K 截断）
-            if used_rank:
-                ref_k = min(Config.RERANK_TOP_K, len(filtered_nodes))
-            else:
-                ref_k = len(filtered_nodes)
-            show_reference_details(filtered_nodes[:ref_k])
+    # 流式输出已在 handle_chat_message_streaming 中完成，这里只显示附加内容
+    # 如果有思维链内容则显示
+    if think_contents:
+        with st.expander("📝 模型思考过程（点击展开）"):
+            for content in think_contents:
+                st.markdown(f'<span style="color: #808080">{content.strip()}</span>', 
+                          unsafe_allow_html=True)
+    
+    # 仅在有参考依据时显示（法律相关问题才有参考依据）
+    if filtered_nodes:
+        # 展示数量与检索/重排序设置联动：
+        # - 启用并成功使用 Rank 时：展示 RERANK_TOP_K 条（已在前面处理时截断）
+        # - 未启用 Rank 时：展示 TOP_K 条（已在前面处理时截断）
+        # filtered_nodes 已经按照相应数量截断了，直接显示全部
+        ref_k = len(filtered_nodes)
+        show_reference_details(filtered_nodes)
     
     # 添加助手消息到历史（需要存储原始响应）
     if filtered_nodes:
-        if used_rank:
-            ref_k = min(Config.RERANK_TOP_K, len(filtered_nodes))
-        else:
-            ref_k = len(filtered_nodes)
+        ref_k = len(filtered_nodes)
     else:
         ref_k = 0
     
