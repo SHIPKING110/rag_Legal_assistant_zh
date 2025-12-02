@@ -43,6 +43,9 @@ from webui.chat_history import (
     render_new_session_button
 )
 
+# 导入法律检索模块
+from webui.legal_search import render_legal_search_page
+
 # 设置环境变量，强制使用本地文件
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
@@ -691,6 +694,12 @@ def init_sidebar():
 
             st.caption("说明文档存放于 `webui/doc_description/`。")
 
+        # ========= 法律检索 =========
+        if st.button("📚 法律检索", use_container_width=True):
+            st.session_state.show_legal_search = True
+            st.session_state.show_docs = False
+            st.rerun()
+
         st.info("💡 提示：DeepSeek模型需要有效的API Key，可在官网申请")
 
         return llm_choice, st.session_state.llm_sub_choice, api_key, temperature, top_p, max_tokens, min_rerank_score
@@ -791,6 +800,11 @@ def main():
 
     # 侧边栏配置
     llm_choice, llm_sub_choice, api_key, temperature, top_p, max_tokens, min_rerank_score = init_sidebar()
+    
+    # 如果处于法律检索模式，则显示检索页面
+    if st.session_state.get("show_legal_search", False):
+        render_legal_search_page()
+        st.stop()
     
     # 如果处于文档模式，则直接显示文档并退出
     if st.session_state.get("show_docs", False):
