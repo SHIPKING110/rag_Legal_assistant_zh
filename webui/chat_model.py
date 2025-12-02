@@ -55,8 +55,34 @@ def build_conversation_context(messages: List[dict], max_turns: int = MAX_HISTOR
     return "\n".join(context_parts)
 
 
+def get_user_profile_context() -> str:
+    """获取用户档案上下文"""
+    try:
+        from webui.chat_history import UserProfileManager
+        profile_manager = UserProfileManager()
+        return profile_manager.get_profile_context()
+    except Exception as e:
+        print(f"[get_user_profile_context] 获取用户档案失败: {e}")
+        return ""
+
+
+def update_user_profile_from_conversation(user_message: str, assistant_response: str):
+    """从对话中提取并更新用户档案"""
+    try:
+        from webui.chat_history import UserProfileManager
+        profile_manager = UserProfileManager()
+        extracted = profile_manager.extract_user_info_from_message(user_message, assistant_response)
+        
+        if extracted:
+            for key, value in extracted.items():
+                profile_manager.update_profile(key, value)
+                print(f"[update_user_profile] 更新用户档案: {key} = {value}")
+    except Exception as e:
+        print(f"[update_user_profile_from_conversation] 更新用户档案失败: {e}")
+
+
 def build_prompt_with_history(current_prompt: str, messages: List[dict]) -> str:
-    """构建包含历史对话的完整提示
+    """构建包含历史对话和用户档案的完整提示
     
     Args:
         current_prompt: 当前用户输入
@@ -65,19 +91,32 @@ def build_prompt_with_history(current_prompt: str, messages: List[dict]) -> str:
     Returns:
         包含历史上下文的完整提示
     """
-    # 排除当前消息（因为当前消息还没有添加到历史中）
+    # 获取用户档案上下文
+    profile_context = get_user_profile_context()
+    
+    # 获取对话历史上下文
     history_context = build_conversation_context(messages)
     
+    prompt_parts = []
+    
+    # 添加用户档案信息
+    if profile_context:
+        prompt_parts.append(f"【用户档案】\n{profile_context}")
+    
+    # 添加对话历史
     if history_context:
-        return f"""以下是之前的对话历史，请参考这些上下文来回答用户的新问题：
+        prompt_parts.append(f"【对话历史】\n{history_context}")
+    
+    if prompt_parts:
+        context = "\n\n".join(prompt_parts)
+        return f"""以下是用户的相关信息和之前的对话历史，请参考这些上下文来回答用户的新问题：
 
-【对话历史】
-{history_context}
+{context}
 
 【当前问题】
 {current_prompt}
 
-请根据对话历史的上下文，回答用户的当前问题。如果当前问题与之前的对话相关，请保持回答的连贯性。"""
+请根据用户档案和对话历史的上下文，回答用户的当前问题。如果用户之前告诉过你他的名字或其他信息，请记住并在适当时候使用。"""
     else:
         return current_prompt
 
@@ -101,20 +140,28 @@ def init_chat_interface():
                         st.markdown(f'<span style="color: #808080">{think_content.strip()}</span>',
                                   unsafe_allow_html=True)
             
-            # 如果是助手消息且有参考依据（需要保持原有参考依据逻辑）
-            if role == "assistant" and "reference_nodes" in msg:
+            # 如果是助手消息且有参考依据（只有法律相关问题才有参考依据）
+            if role == "assistant" and msg.get("reference_nodes"):
                 show_reference_details(msg["reference_nodes"])
 
 
 def show_reference_details(nodes):
     """显示参考依据详情"""
+    # 如果没有参考节点，不显示
+    if not nodes:
+        return
+    
     with st.expander("查看支持依据"):
         for idx, node in enumerate(nodes, 1):
-            meta = node.node.metadata
-            st.markdown(f"**[{idx}] {meta['full_title']}**")
-            st.caption(f"来源文件：{meta['source_file']} | 法律名称：{meta['law_name']}")
-            st.markdown(f"相关度：`{node.score:.4f}`")
-            st.info(f"{node.node.text}")
+            try:
+                meta = node.node.metadata
+                st.markdown(f"**[{idx}] {meta['full_title']}**")
+                st.caption(f"来源文件：{meta['source_file']} | 法律名称：{meta['law_name']}")
+                st.markdown(f"相关度：`{node.score:.4f}`")
+                st.info(f"{node.node.text}")
+            except (AttributeError, KeyError):
+                # 处理从历史加载的简化节点数据
+                pass
 
 
 def synthesize_with_retries(synthesizer, prompt: str, nodes: List, retries: int = 3, initial_delay: float = 2.0):
@@ -473,4 +520,11 @@ def display_chat_response(response_text: str, filtered_nodes: List, used_rank: b
         "think": think_contents,  # 存储思维链内容
         "reference_nodes": filtered_nodes[:ref_k] if filtered_nodes else []  # 存储参考节点
     })
+    
+    # 从对话中提取用户信息并更新档案
+    # 获取最后一条用户消息
+    user_messages = [m for m in st.session_state.messages if m.get("role") == "user"]
+    if user_messages:
+        last_user_msg = user_messages[-1].get("content", "")
+        update_user_profile_from_conversation(last_user_msg, cleaned_response)
 
