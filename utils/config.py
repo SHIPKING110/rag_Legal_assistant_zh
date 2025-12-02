@@ -15,6 +15,8 @@ class Config:
     DATA_DIR = "./json_data"
     VECTOR_DB_DIR = "./chroma_db"
     PERSIST_DIR = "./storage"
+    PROMPT_DIR = "./prompt"
+    LEGAL_CHAT_PROMPT_PATH = "./prompt/falv_chat_model_prompt.txt"
     
     # 向量数据库配置
     COLLECTION_NAME = "chinese_labor_laws"
