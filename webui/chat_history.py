@@ -18,8 +18,15 @@ class UserProfileManager:
     
     PROFILE_FILE = "./rag_falv_data/chat_data/user_profile.json"
     
-    def __init__(self):
-        """初始化用户档案管理器"""
+    def __init__(self, user_id: Optional[str] = None):
+        """初始化用户档案管理器
+        
+        Args:
+            user_id: 用户ID，如果提供则使用用户专属目录
+        """
+        self.user_id = user_id
+        if user_id:
+            self.PROFILE_FILE = f"./rag_falv_data/users/{user_id}/user_profile.json"
         self._ensure_file()
     
     def _ensure_file(self):
@@ -105,8 +112,15 @@ class ChatHistoryManager:
     
     CHAT_DATA_DIR = "./rag_falv_data/chat_data"
     
-    def __init__(self):
-        """初始化管理器，确保数据目录存在"""
+    def __init__(self, user_id: Optional[str] = None):
+        """初始化管理器，确保数据目录存在
+        
+        Args:
+            user_id: 用户ID，如果提供则使用用户专属目录
+        """
+        self.user_id = user_id
+        if user_id:
+            self.CHAT_DATA_DIR = f"./rag_falv_data/users/{user_id}/chat_data"
         self._ensure_data_dir()
     
     def _ensure_data_dir(self):
@@ -321,10 +335,33 @@ class ChatHistoryManager:
         return new_session_id
 
 
+def get_current_user_id() -> Optional[str]:
+    """获取当前登录用户的ID"""
+    if st.session_state.get("authenticated") and st.session_state.get("username"):
+        username = st.session_state.username
+        if username == "游客":
+            return None  # 游客使用默认目录
+        # 从用户管理器获取user_id
+        from webui.auth import UserManager
+        user_manager = UserManager()
+        user_info = user_manager.get_user_info(username)
+        if user_info:
+            return user_info.get("user_id")
+    return None
+
+
 def init_session_state_for_chat_history():
     """初始化会话历史相关的 session_state"""
-    if "chat_history_manager" not in st.session_state:
-        st.session_state.chat_history_manager = ChatHistoryManager()
+    # 获取当前用户ID
+    user_id = get_current_user_id()
+    
+    # 如果用户切换了，重新初始化管理器
+    if "chat_history_manager" not in st.session_state or st.session_state.get("last_user_id") != user_id:
+        st.session_state.chat_history_manager = ChatHistoryManager(user_id)
+        st.session_state.last_user_id = user_id
+        # 清空当前会话，强制重新加载
+        if "current_session_id" in st.session_state:
+            del st.session_state.current_session_id
     
     if "current_session_id" not in st.session_state:
         # 尝试加载最近的会话

@@ -58,8 +58,9 @@ def build_conversation_context(messages: List[dict], max_turns: int = MAX_HISTOR
 def get_user_profile_context() -> str:
     """获取用户档案上下文"""
     try:
-        from webui.chat_history import UserProfileManager
-        profile_manager = UserProfileManager()
+        from webui.chat_history import UserProfileManager, get_current_user_id
+        user_id = get_current_user_id()
+        profile_manager = UserProfileManager(user_id)
         return profile_manager.get_profile_context()
     except Exception as e:
         print(f"[get_user_profile_context] 获取用户档案失败: {e}")
@@ -69,8 +70,9 @@ def get_user_profile_context() -> str:
 def update_user_profile_from_conversation(user_message: str, assistant_response: str):
     """从对话中提取并更新用户档案"""
     try:
-        from webui.chat_history import UserProfileManager
-        profile_manager = UserProfileManager()
+        from webui.chat_history import UserProfileManager, get_current_user_id
+        user_id = get_current_user_id()
+        profile_manager = UserProfileManager(user_id)
         extracted = profile_manager.extract_user_info_from_message(user_message, assistant_response)
         
         if extracted:
