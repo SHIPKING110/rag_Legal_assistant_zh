@@ -7,13 +7,79 @@ import re
 import time
 import traceback
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import streamlit as st
 from llama_index.core import get_response_synthesizer
 from llama_index.llms.huggingface import HuggingFaceLLM
 
 from utils import Config, LLM_CONFIGS
+
+# 短期记忆配置
+MAX_HISTORY_TURNS = 5  # 最多保留最近5轮对话作为上下文
+
+
+def build_conversation_context(messages: List[dict], max_turns: int = MAX_HISTORY_TURNS) -> str:
+    """构建对话历史上下文
+    
+    Args:
+        messages: 消息列表
+        max_turns: 最大保留轮数
+    
+    Returns:
+        格式化的对话历史字符串
+    """
+    if not messages:
+        return ""
+    
+    # 获取最近的对话（每轮包含用户和助手各一条消息）
+    recent_messages = messages[-(max_turns * 2):]
+    
+    if not recent_messages:
+        return ""
+    
+    context_parts = []
+    for msg in recent_messages:
+        role = msg.get("role", "")
+        # 使用清理后的内容，避免包含思维链等
+        content = msg.get("cleaned", msg.get("content", ""))
+        
+        if role == "user":
+            context_parts.append(f"用户: {content}")
+        elif role == "assistant":
+            # 截断过长的回复
+            if len(content) > 500:
+                content = content[:500] + "..."
+            context_parts.append(f"助手: {content}")
+    
+    return "\n".join(context_parts)
+
+
+def build_prompt_with_history(current_prompt: str, messages: List[dict]) -> str:
+    """构建包含历史对话的完整提示
+    
+    Args:
+        current_prompt: 当前用户输入
+        messages: 历史消息列表
+    
+    Returns:
+        包含历史上下文的完整提示
+    """
+    # 排除当前消息（因为当前消息还没有添加到历史中）
+    history_context = build_conversation_context(messages)
+    
+    if history_context:
+        return f"""以下是之前的对话历史，请参考这些上下文来回答用户的新问题：
+
+【对话历史】
+{history_context}
+
+【当前问题】
+{current_prompt}
+
+请根据对话历史的上下文，回答用户的当前问题。如果当前问题与之前的对话相关，请保持回答的连贯性。"""
+    else:
+        return current_prompt
 
 
 def init_chat_interface():
@@ -162,11 +228,18 @@ def handle_chat_message_streaming(
         st.error("❌ LLM未初始化")
         st.stop()
     
+    # 获取历史消息用于构建上下文
+    history_messages = st.session_state.get("messages", [])
+    
     is_legal = is_legal_related(prompt, llm)
     
     if not is_legal:
         # 与法律无关，直接使用对话模型回答（流式）
         st.info("💬 检测到问题与法律无关，使用对话模式回答")
+        
+        # 构建包含历史上下文的提示
+        prompt_with_history = build_prompt_with_history(prompt, history_messages)
+        
         # 创建助手消息容器
         with st.chat_message("assistant"):
             try:
@@ -174,7 +247,7 @@ def handle_chat_message_streaming(
                 response_text = ""
                 message_placeholder = st.empty()
                 try:
-                    for token in llm.stream_complete(prompt):
+                    for token in llm.stream_complete(prompt_with_history):
                         if hasattr(token, 'delta'):
                             response_text += token.delta
                         else:
@@ -183,7 +256,7 @@ def handle_chat_message_streaming(
                     message_placeholder.markdown(response_text)
                 except (AttributeError, TypeError):
                     # 如果不支持流式，使用非流式方法
-                    response = llm.complete(prompt)
+                    response = llm.complete(prompt_with_history)
                     response_text = response.text
                     # 模拟流式效果
                     for i in range(0, len(response_text), 5):
@@ -244,10 +317,19 @@ def handle_chat_message_streaming(
                 except Exception as e:
                     print(f"[handle_chat_message_streaming] 读取法律提示词模版失败: {e}")
 
+                # 构建包含历史上下文的提示
+                history_context = build_conversation_context(history_messages)
+                
                 if legal_prompt_text:
-                    full_prompt = f"{legal_prompt_text}\n\n用户问题：{prompt}"
+                    if history_context:
+                        full_prompt = f"{legal_prompt_text}\n\n【对话历史】\n{history_context}\n\n【当前问题】\n{prompt}"
+                    else:
+                        full_prompt = f"{legal_prompt_text}\n\n用户问题：{prompt}"
                 else:
-                    full_prompt = prompt
+                    if history_context:
+                        full_prompt = f"【对话历史】\n{history_context}\n\n【当前问题】\n{prompt}"
+                    else:
+                        full_prompt = prompt
 
                 # 生成回答（流式输出）
                 try:
