@@ -31,8 +31,16 @@ from utils import Config, LLM_CONFIGS, DEEPSEEK_MODELS, GLM_MODELS, QWEN_MODELS
 from webui.chat_model import (
     init_chat_interface,
     show_reference_details,
-    handle_chat_message,
+    handle_chat_message_streaming,
     display_chat_response
+)
+
+# 导入会话历史管理模块
+from webui.chat_history import (
+    ChatHistoryManager,
+    init_session_state_for_chat_history,
+    render_chat_history_sidebar,
+    render_new_session_button
 )
 
 # 设置环境变量，强制使用本地文件
@@ -441,10 +449,11 @@ def init_sidebar():
         if "doc_category" not in st.session_state:
             st.session_state.doc_category = DOC_PLACEHOLDER
         
-        if st.button("💬 聊天对话", use_container_width=True):
-            st.session_state.show_docs = False
-            st.session_state.doc_category = DOC_PLACEHOLDER
-            st.rerun()
+        # ========= 新建会话按钮（最上面） =========
+        render_new_session_button()
+        
+        # ========= 历史会话列表 =========
+        render_chat_history_sidebar()
         
         # 默认值初始化，避免未进入折叠面板时返回 None
         temperature = 0.3
@@ -562,8 +571,30 @@ def init_sidebar():
 
         # ========= 检索参数 =========
         with st.expander("检索参数", expanded=False):
-            top_k = st.slider("检索数量", 5, 30, Config.TOP_K, 5)
-            rerank_top_k = st.slider("重排序数量", 1, 10, Config.RERANK_TOP_K, 1)
+            # 使用 session_state 保存滑块值，避免每次重新渲染时回到默认值
+            if "top_k_value" not in st.session_state:
+                st.session_state.top_k_value = Config.TOP_K
+            if "rerank_top_k_value" not in st.session_state:
+                st.session_state.rerank_top_k_value = Config.RERANK_TOP_K
+            
+            top_k = st.slider(
+                "检索数量", 
+                5, 30, 
+                value=st.session_state.top_k_value, 
+                step=5,
+                key="top_k_slider"
+            )
+            st.session_state.top_k_value = top_k
+            
+            rerank_top_k = st.slider(
+                "重排序数量", 
+                1, 10, 
+                value=st.session_state.rerank_top_k_value, 
+                step=1,
+                key="rerank_top_k_slider"
+            )
+            st.session_state.rerank_top_k_value = rerank_top_k
+            
             min_rerank_score = st.slider("最小重排序分数", 0.0, 1.0, 0.4, 0.1)
 
         Config.TOP_K = top_k
@@ -826,10 +857,10 @@ def main():
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # 处理查询
+        # 处理查询（流式输出）
         with st.spinner("正在分析问题..."):
-            # 调用聊天模块处理消息
-            response_text, filtered_nodes, used_rank = handle_chat_message(
+            # 调用聊天模块处理消息（流式，内部已创建 assistant 消息容器）
+            response_text, filtered_nodes, used_rank = handle_chat_message_streaming(
                 prompt=prompt,
                 retriever=retriever,
                 response_synthesizer=response_synthesizer,
@@ -838,8 +869,15 @@ def main():
                 try_auto_switch_llm_func=try_auto_switch_llm
             )
             
-            # 显示响应
+            # 显示响应（附加内容如思维链、参考依据等）
             display_chat_response(response_text, filtered_nodes, used_rank)
+            
+            # 自动保存当前会话
+            if "chat_history_manager" in st.session_state and "current_session_id" in st.session_state:
+                st.session_state.chat_history_manager.save_session(
+                    st.session_state.current_session_id,
+                    st.session_state.messages
+                )
 
 if __name__ == "__main__":
     main()
